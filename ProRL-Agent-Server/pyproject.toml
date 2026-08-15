@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polar"
+version = "0.1.0"
+description = "Polar is a rollout server for agent RL."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Binfeng Xu, Yi Dong, Hao Zhang, Shaokun Zhang, Songyang Han, Jian Hu, Mingjie Liu, etc" },
+]
+
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.9.0",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/NVIDIA-NeMo/ProRL-Agent-Server"
+Repository = "https://github.com/NVIDIA-NeMo/ProRL-Agent-Server"
+Issues = "https://github.com/NVIDIA-NeMo/ProRL-Agent-Server/issues"
+
+[project.optional-dependencies]
+swebench = [
+    "swebench",
+    "datasets",
+]
+
+[project.scripts]
+polar = "polar.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+    "build>=1.2.0",
+    "twine>=5.0.0",
+]
+
+[tool.uv]
+torch-backend = "auto"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["polar*", "slime_bridge*"]
+
+[tool.setuptools.package-data]
+polar = [
+    "**/README.md",
+    "platform/web/dist/**/*",
+]
+slime_bridge = ["README.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+    ".git",
+    ".venv",
+    "build",
+    "dist",
+    "examples",
+    "logs",
+    "train-logs",
+    "tmp",
+    "rollout_results",
+    "slime",
+    "Megatron-LM",
+]
+markers = [
+    "unit: fast CPU-only checks",
+    "integration: checks that need local services or external programs",
+    "gpu: checks that need GPU-backed model serving",
+]
+
+[tool.ruff]
+line-length = 99
+target-version = "py311"
+exclude = [
+    ".git",
+    ".venv",
+    "build",
+    "dist",
+    "slime",
+    "Megatron-LM",
+    "logs",
+    "train-logs",
+    "tmp",
+    "rollout_results",
+]

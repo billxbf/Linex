@@ -1,0 +1,26 @@
+accelerate
+aiohttp
+datasets
+dion @ git+https://github.com/microsoft/dion.git
+einops
+grpcio>=1.74.0
+huggingface_hub>=1.0.0
+jsonlines
+nemo-automodel @ git+https://github.com/NVIDIA-NeMo/Automodel.git@e8a163b97ff979d7bf779e0509eda20ce1c3557d
+optree>=0.15.0
+packaging
+peft
+pylatexenc
+pynvml>=12.0.0
+ray[default]==2.55.0
+sympy
+tensorboard
+torch
+torchdata
+torchmetrics
+tqdm
+transformers
+vllm
+vllm-router>=0.1.14
+wandb
+wheel

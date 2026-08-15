@@ -1,0 +1,117 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Adapted from OpenRLHF (https://github.com/OpenRLHF/OpenRLHF),
+# Copyright (c) OpenRLHF contributors, licensed under the Apache License, Version 2.0.
+
+import os
+
+from datasets import interleave_datasets, load_dataset, load_from_disk
+
+
+def blending_datasets(
+    datasets,
+    probabilities=None,
+    strategy=None,
+    seed=42,
+    max_count=1e8,
+    stopping_strategy="all_exhausted",
+    dataset_split="train",
+):
+    """Blend multiple datasets with optional probability sampling.
+
+    Args:
+        datasets (str): Comma-separated list of dataset paths
+        probabilities (str, optional): Comma-separated list of probabilities for sampling.
+            If None, datasets will be concatenated without probability sampling.
+        strategy: Training strategy object
+        seed (int): Random seed
+        max_count (int): Maximum number of samples per dataset
+    """
+    datasets = datasets.split(",")
+    if probabilities is not None:
+        probabilities = list(map(float, probabilities.split(",")))
+        assert len(probabilities) == len(datasets)
+
+    data_list = []
+    for dataset in datasets:
+        dataset = dataset.strip()
+        strategy.print(f"dataset: {dataset}")
+
+        data_dir = dataset.split("@")[1].strip() if "@" in dataset else None
+        dataset = dataset.split("@")[0].strip()
+        dataset_basename = os.path.basename(dataset)
+
+        ext = os.path.splitext(dataset)[-1]
+        # local python script
+        if ext == ".py" or (
+            os.path.isdir(dataset) and os.path.exists(os.path.join(dataset, f"{dataset_basename}.py"))
+        ):
+            data = load_dataset(dataset, trust_remote_code=True)
+            strategy.print(f"loaded {dataset} with python script")
+        # local text file
+        elif ext in [".json", ".jsonl", ".csv", ".parquet", ".arrow"]:
+            ext = ext.lower().strip(".")
+            if ext == "jsonl":
+                ext = "json"
+            data = load_dataset(ext, data_files=dataset)
+            strategy.print(f"loaded {dataset} with data_files={dataset}")
+        # local dataset saved with `datasets.Dataset.save_to_disk`
+        elif os.path.isdir(dataset):
+            try:
+                data = load_from_disk(dataset)
+                strategy.print(f"loaded {dataset} from disk")
+            except Exception as e:
+                strategy.print(f"failed to load {dataset} from disk: {e}")
+                data = load_dataset(dataset, data_dir=data_dir)
+                strategy.print(f"loaded {dataset} from files")
+        # remote/local folder or common file
+        elif strategy.args.use_ms:
+            from modelscope.msdatasets import MsDataset
+
+            namespace, dataset = dataset.split("/")
+            data = MsDataset.load(dataset, namespace=namespace)
+        else:
+            data = load_dataset(dataset, data_dir=data_dir)
+            strategy.print(f"loaded {dataset} from files")
+
+        # Index by split only for split-keyed objects (a DatasetDict is a dict).
+        # A plain Dataset has no __contains__, so `split in data` would fall back
+        # to __iter__ and scan every row (30+ min hang on a large dataset).
+        if dataset_split and isinstance(data, dict) and dataset_split in data:
+            data = data[dataset_split]
+        # int(): max_count defaults to the float 1e8, and range() rejects a
+        # float, so a dataset larger than max_count would crash here.
+        data = data.select(range(min(int(max_count), len(data))))
+        data_list.append(data)
+
+    # merge datasets
+    if strategy.is_rank_0():
+        print(data_list)
+
+    # If probabilities is None, concatenate datasets directly
+    if probabilities is None:
+        from datasets import concatenate_datasets
+
+        dataset = concatenate_datasets(data_list)
+    else:
+        dataset = interleave_datasets(
+            data_list,
+            probabilities=probabilities,
+            seed=seed,
+            stopping_strategy=stopping_strategy,
+        )
+
+    return dataset

@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+@theme {
+  --color-status-running: #2563eb;
+  --color-status-completed: #16a34a;
+  --color-status-error: #dc2626;
+  --color-status-timeout: #d97706;
+  --color-status-pending: #6b7280;
+  --color-status-build: #7c3aed;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+pre.json {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
