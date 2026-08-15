@@ -164,5 +164,11 @@ outputs/
 slurm-*.out
 checkpoints
 
+# local dev files
+rfcs/
+
 # local benchmark workspace (untracked; slated to move into .tmp)
 /bench/
+
+# polar intermediate files
+rollout_results/

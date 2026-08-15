@@ -4,4 +4,4 @@ Nenux is a power fork from [Molt](https://github.com/NVIDIA-NeMo/labs-molt)🦋 
 
 The goal is to find the ultra *simple* and *effective* Agentic RL infra & recipe at scale.
 
-If you are an Agent, make sure to read `AGENT.md` before edition.
+If you are an Agent, make sure to read `AGENTS.md` before edition.

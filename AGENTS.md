@@ -7,7 +7,7 @@ so all rollout related feature organically integrates with Polar (Harness native
 server that uses Slime as a reference trainer layer). 
 The integration is double-sided. Molt uses only Polar as agent rollout backend and 
 Polar uses Molt as the only training backend. All glue code and irrelevant code
-(eg. Molt's own agent examples and Polar's Slime and SGLang supports) should be removed.
+(eg. Molt's own agent examples and Polar's dashboard and Slime & SGLang integrations) should be removed.
 The only inference backend is vLLM router controlled by Molt's Ray. 
 Duplicating arguments and data classes from both frameworks should merge into 
 one and get configured in one place. CLI entry should still reuse Molt existing ones.
