@@ -1,3 +1,3 @@
 # Nenux
 
-Nenux is a power fork of [Molt](git@github.com:NVIDIA-NeMo/labs-molt.git) 🦋 and [Polar](git@github.com:NVIDIA-NeMo/ProRL-Agent-Server.git) ⭐, in seek of the one ultra simple and effective Agent RL infra and recipe.
+Nenux is a power fork from [Molt](https://github.com/NVIDIA-NeMo/labs-molt)🦋 and [Polar](https://github.com/NVIDIA-NeMo/ProRL-Agent-Server)⭐, pruned to implement the ultra simple and effective Agentic RL infra & recipe.
