@@ -186,7 +186,7 @@ AutoModel this repo is validated against, so R3 routing replay and Muon work out
 ```bash
 git clone https://github.com/NVIDIA-NeMo/labs-molt.git
 cd labs-molt
-pip install -e ".[vllm]"          # local development only — the container bakes everything in
+pip install -e .                   # local development only — the container bakes everything in
 ```
 
 **The recommended path is the project container** (`dockerfile/Dockerfile`). It bakes the
@@ -207,7 +207,7 @@ docker build -f dockerfile/Dockerfile -t hijkzzz/molt:latest .
 The released package is also on PyPI for checkout-free installs:
 
 ```bash
-pip install "molt-rl[vllm]"
+pip install molt-rl
 ```
 
 > **Note**: PyPI forbids git-pinned dependencies, so `molt-rl` depends on AutoModel's PyPI
