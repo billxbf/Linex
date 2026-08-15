@@ -20,7 +20,7 @@
 # standard batch / context / dataset as slurm/qwen3_4b.sh — only the topology
 # differs (1 node here, 2 nodes there).
 #
-#   MODEL_PATH=/path/to/Qwen3-4B bash examples/scripts/quick_start/qwen3_4b.sh
+#   MODEL_PATH=/path/to/Qwen3-4B bash examples/molt/scripts/quick_start/qwen3_4b.sh
 
 set -euo pipefail
 
@@ -103,7 +103,7 @@ python3 -u -m molt.cli.train_rl_ray \
   --algo.dynamic_filtering_enable \
   --algo.dynamic_filtering_range 0.01 0.99 \
   --reward.clip_range -10 10 \
-  --train.agent_path "$REPO_ROOT/examples/python/agents/math.py" \
+  --train.agent_path "$REPO_ROOT/examples/molt/python/agents/math.py" \
   --eval.dataset "$EVAL_DATASET" \
   --eval.steps 5 \
   --eval.n_samples_per_prompt 1 \

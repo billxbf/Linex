@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 profile = "black"  # black-compatible
 line_length = 119  # should match black parameters
 ignore_whitespace = true  # ignore whitespace for compatibility with the initial style
-py_version = 310  # python 3.10 as a target version
+py_version = 311  # python 3.11 as a target version
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
 default_section = "THIRDPARTY"
 extend_skip = ["setup.py", "docs/source/conf.py"]
@@ -21,6 +21,7 @@ line_length = 119
 
 [tool.ruff]
 line-length = 119
+target-version = "py311"
 
 [tool.pytest.ini_options]
 # durations=0 will display all tests execution time, sorted in ascending order starting from from the slowest one.
@@ -56,7 +57,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["molt"]
+source = ["molt", "polar"]
 
 [tool.coverage.paths]
 source = [

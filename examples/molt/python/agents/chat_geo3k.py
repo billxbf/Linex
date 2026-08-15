@@ -15,7 +15,7 @@
 
 """Multi-turn geo3k chat agent — python_executor tool calls + `<answer>` grading.
 
-Mirrors examples/python/agents/geo3k.py but uses the black-box chat harness:
+Mirrors examples/molt/python/agents/geo3k.py but uses the black-box chat harness:
 agent → stock OpenAI SDK → loopback server (which captures token traces via
 the session-prefixed `ctx.base_url`). The agent owns the turn loop; the
 server stitches the per-turn token traces into the training trajectory.

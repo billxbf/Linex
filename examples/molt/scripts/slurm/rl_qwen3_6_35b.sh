@@ -118,7 +118,7 @@ if [ "$CHAIN_DEPTH" -lt "$CHAIN_MAX" ]; then
     ${SLURM_JOB_RESERVATION:+--reservation="$SLURM_JOB_RESERVATION"} \
     --nodes="$SLURM_JOB_NUM_NODES" \
     --comment="$SBATCH_COMMENT" \
-    "$REPO_ROOT/examples/scripts/slurm/rl_qwen3_6_35b.sh")
+    "$REPO_ROOT/examples/molt/scripts/slurm/rl_qwen3_6_35b.sh")
   echo "[chain] depth=$NEXT_DEPTH/$CHAIN_MAX next_jobid=$next_jobid"
 fi
 
@@ -139,14 +139,14 @@ MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to the VLM checkpoint to train.}"
 DEFAULT_DATA_DIR="$REPO_ROOT/.tmp/geo3k"
 if [ -z "${PROMPT_DATASET:-}" ] && [ ! -d "$DEFAULT_DATA_DIR/train" ]; then
   echo "[launcher] preparing geo3k VLM (VeraIsHere/geo3k_imgurl_processed) — one-time"
-  python3 "$REPO_ROOT/examples/python/utils/prepare_geo3k.py" \
+  python3 "$REPO_ROOT/examples/molt/python/utils/prepare_geo3k.py" \
     --max-eval 256 --num-proc 8 --out-dir "$DEFAULT_DATA_DIR"
 fi
 PROMPT_DATASET="${PROMPT_DATASET:-$DEFAULT_DATA_DIR/train}"
 EVAL_DATASET="${EVAL_DATASET:-$DEFAULT_DATA_DIR/eval}"
 
 SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/molt-async-visual-rl/$SLURM_JOB_ID}"
-AGENT_PATH="${AGENT_PATH:-/molt/examples/python/agents/geo3k.py}"
+AGENT_PATH="${AGENT_PATH:-/molt/examples/molt/python/agents/geo3k.py}"
 
 # Default the AutoModel source override to the sibling checkout if it exists, so
 # the latest main wins over the version baked into the container image.

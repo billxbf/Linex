@@ -4,11 +4,10 @@
 Each harness gets the same image at `/polar/session/workspace/polar_stars.png`,
 inspects it, and writes its star count to `answer.txt`. This exercises image
 input through the local OpenAI-compatible inference backend. All harnesses are
-submitted at once; per-session detail is visible in the dashboard
-(`polar dashboard -c examples/count_stars/topology.vllm.yaml`).
+submitted at once and progress is reported while the rollout task API is polled.
 
-    uv run python examples/count_stars/run.py                 # docker (default)
-    uv run python examples/count_stars/run.py --backend apptainer
+    uv run python examples/polar/count_stars/run.py                 # docker (default)
+    uv run python examples/polar/count_stars/run.py --backend apptainer
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ import httpx
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 IMAGE_FILE = EXAMPLE_DIR / "assets" / "polar_stars.png"
-DEFAULT_TOPOLOGY = EXAMPLE_DIR / "topology.vllm.yaml"
+DEFAULT_TOPOLOGY = EXAMPLE_DIR / "topology.yaml"
 RUNTIME_IMAGE = "polar-localhost-count-stars:latest"
 RUNTIME_IMAGE_PATH = "/polar/session/workspace/polar_stars.png"
 NUM_SAMPLES = 4
@@ -128,7 +127,7 @@ def main() -> int:
             task_ids[harness] = resp.json()["task_id"]
             print(f"  {harness:<16} -> {task_ids[harness]}")
 
-        print(f"\nPolling every {POLL_INTERVAL_SECONDS:.0f}s (watch live in the dashboard) ...")
+        print(f"\nPolling every {POLL_INTERVAL_SECONDS:.0f}s ...")
         t0 = time.monotonic()
         finished: dict[str, dict[str, Any]] = {}
         while len(finished) < len(HARNESSES):

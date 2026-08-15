@@ -88,7 +88,7 @@ export PROMPT_DATASET="${PROMPT_DATASET:-$REPO_ROOT/.tmp/geo3k_answer/train}"
 export EVAL_DATASET="${EVAL_DATASET:-}"
 if [ ! -d "$REPO_ROOT/.tmp/geo3k_answer/train" ]; then
   echo "[distill-omni3] preparing geo3k (<answer> format) — one-time"
-  python3 "$REPO_ROOT/examples/python/utils/prepare_geo3k.py" \
+  python3 "$REPO_ROOT/examples/molt/python/utils/prepare_geo3k.py" \
     --answer-format answer --max-eval 256 --num-proc 8 \
     --out-dir "$REPO_ROOT/.tmp/geo3k_answer"
 fi
@@ -124,7 +124,7 @@ if [ "$CHAIN_DEPTH" -lt "$CHAIN_MAX" ]; then
     ${SLURM_JOB_RESERVATION:+--reservation="$SLURM_JOB_RESERVATION"} \
     --nodes="$SLURM_JOB_NUM_NODES" \
     --comment='{"IdleGpuReaper":{"exemptIdleTimeMins":"120","reason":"other","description":"Async on-policy distillation; GPUs idle as train/rollout alternate"}}' \
-    "$REPO_ROOT/examples/scripts/slurm/rl_distill_omni3_30b.sh")
+    "$REPO_ROOT/examples/molt/scripts/slurm/rl_distill_omni3_30b.sh")
   echo "[chain] depth=$NEXT_DEPTH/$CHAIN_MAX next_jobid=$next_jobid"
 fi
 

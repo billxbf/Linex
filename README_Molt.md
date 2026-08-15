@@ -9,7 +9,7 @@ Ray · vLLM · NVIDIA AutoModel — the smallest PyTorch-native stack for
 
 <br/>
 
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-native-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)
 ![NVIDIA AutoModel](https://img.shields.io/badge/Training-NVIDIA_AutoModel-76B900?style=flat-square&logo=nvidia&logoColor=white)
 ![vLLM](https://img.shields.io/badge/Rollout-vLLM-7c3aed?style=flat-square)
@@ -179,7 +179,7 @@ sequence-level masked IS, which motivates the `seq`/`geo` rejection filter).
 ## 📦 Installation
 
 First clone the repo — the launch scripts, agents, and recipes live here, and
-`examples/scripts/docker_run.sh` mounts this checkout into the container. For local
+`examples/molt/scripts/docker_run.sh` mounts this checkout into the container. For local
 (non-container) development, add the editable install: it pulls the exact git-pinned
 AutoModel this repo is validated against, so R3 routing replay and Muon work out of the box:
 
@@ -237,7 +237,7 @@ python3 -m molt.cli.train_rl_ray \
   --actor.model_name_or_path /path/to/automodel \
   --data.prompt_dataset /path/to/prompts.jsonl \
   --data.input_key input \
-  --train.agent_path examples/python/agents/math.py \
+  --train.agent_path examples/molt/python/agents/math.py \
   --vllm.num_engines 2 \
   --vllm.tensor_parallel_size 2 \
   --rollout.batch_size 128 \
@@ -376,18 +376,18 @@ agent-side change is needed — it works on both wires, including external harne
 | `images` | Optional list of next-turn images |
 | `sampling_params` | Optional per-turn override |
 
-Four reference agents ship under `examples/python/agents/`:
+Four reference agents ship under `examples/molt/python/agents/`:
 
 ```bash
---train.agent_path examples/python/agents/math.py          # Env: single-turn boxed grader
---train.agent_path examples/python/agents/geo3k.py         # Env: VLM multi-turn + Python tool
---train.agent_path examples/python/agents/chat_minimal.py  # ChatAgent: hello-world chat loop
---train.agent_path examples/python/agents/chat_geo3k.py    # ChatAgent: VLM multi-turn + Python tool
+--train.agent_path examples/molt/python/agents/math.py          # Env: single-turn boxed grader
+--train.agent_path examples/molt/python/agents/geo3k.py         # Env: VLM multi-turn + Python tool
+--train.agent_path examples/molt/python/agents/chat_minimal.py  # ChatAgent: hello-world chat loop
+--train.agent_path examples/molt/python/agents/chat_geo3k.py    # ChatAgent: VLM multi-turn + Python tool
 ```
 
 ## 🍳 Recipes
 
-Reference launch scripts live under `examples/scripts/`. Two end-to-end
+Reference launch scripts live under `examples/molt/scripts/`. Two end-to-end
 families ship today, both on the AutoModel + FSDP2 backend:
 
 | Workflow | quick_start | slurm |
@@ -403,15 +403,15 @@ families ship today, both on the AutoModel + FSDP2 backend:
 Quick-start single-node usage:
 
 ```bash
-MODEL_PATH=/path/to/Qwen3-4B bash examples/scripts/quick_start/rl_qwen3_4b.sh
+MODEL_PATH=/path/to/Qwen3-4B bash examples/molt/scripts/quick_start/rl_qwen3_4b.sh
 ```
 
 The geo3k VLM scripts (`rl_qwen3_6_35b.sh` / `sft_qwen3_6_35b.sh`) auto-prepare the
-dataset on first run via `examples/python/utils/prepare_geo3k.py`. To pre-stage it
+dataset on first run via `examples/molt/python/utils/prepare_geo3k.py`. To pre-stage it
 manually (or refresh it), run:
 
 ```bash
-python3 examples/python/utils/prepare_geo3k.py --num-proc 8 --out-dir .tmp/geo3k
+python3 examples/molt/python/utils/prepare_geo3k.py --num-proc 8 --out-dir .tmp/geo3k
 ```
 
 Or point `PROMPT_DATASET` / `EVAL_DATASET` at your own data.
@@ -420,18 +420,18 @@ Slurm usage:
 
 ```bash
 # 1) SFT smoke on interactive 2 nodes
-sbatch examples/scripts/slurm/sft_qwen3_6_35b.sh
+sbatch examples/molt/scripts/slurm/sft_qwen3_6_35b.sh
 
 # 2) RL smoke on interactive 2 nodes (auto-preps geo3k on first run)
-sbatch examples/scripts/slurm/rl_qwen3_6_35b.sh
+sbatch examples/molt/scripts/slurm/rl_qwen3_6_35b.sh
 
 # 3) Scale RL to 4 nodes for convergence
-sbatch --nodes=4 examples/scripts/slurm/rl_qwen3_6_35b.sh
+sbatch --nodes=4 examples/molt/scripts/slurm/rl_qwen3_6_35b.sh
 ```
 
 ### Multi-turn Python tool env
 
-`examples/python/agents/geo3k.py` is the VLM multi-turn recipe used by the
+`examples/molt/python/agents/geo3k.py` is the VLM multi-turn recipe used by the
 Qwen3.6 RL script. The model emits a `<tool_call>` invoking
 `python_executor(code=...)`; the env runs the snippet in a sandboxed
 subprocess and feeds the captured stdout back as a `<tool_response>` turn.
@@ -443,7 +443,7 @@ and becomes the reward.
 ### OpenAI- / Anthropic-compatible server agent
 
 For agents that already speak OpenAI Chat Completions or the Anthropic Messages
-API, subclass `ChatAgent` (see `examples/python/agents/chat_minimal.py`). The
+API, subclass `ChatAgent` (see `examples/molt/python/agents/chat_minimal.py`). The
 auto-launched server exposes both `/v1/chat/completions` and `/v1/messages`
 against the rolling vLLM engines, so any external loop (browser automation, eval
 harness, OSWorld …) can drive the policy through a stock OpenAI or Anthropic SDK
@@ -489,7 +489,7 @@ matches the teacher; task accuracy is not the objective, so eval is off.
 To distill a **multi-turn tool-use distribution** (matching how the student is
 actually deployed), point `--train.agent_path` at the task's real agent (e.g.
 `chat_geo3k.py`) — its reward is simply ignored by the estimator.
-`examples/scripts/slurm/rl_distill_omni3_30b.sh` is a ready VLM example off the omni3
+`examples/molt/scripts/slurm/rl_distill_omni3_30b.sh` is a ready VLM example off the omni3
 EP8 / CP8 / TE / DeepEP recipe.
 
 ## 🎛️ Scaling Knobs
@@ -594,7 +594,7 @@ fixed router is acceptable.
 Fast local checks:
 
 ```bash
-python -m compileall -q molt examples/python tests
+python -m compileall -q molt examples/molt/python tests
 pytest -q
 ```
 
@@ -602,7 +602,7 @@ Container checks:
 
 ```bash
 SKIP_BUILD=1 DOCKER_GPUS=all DOCKER_SHM_SIZE=32g \
-  bash examples/scripts/docker_run.sh "pytest -q"
+  bash examples/molt/scripts/docker_run.sh "pytest -q"
 ```
 
 ## 🙏 Acknowledgement

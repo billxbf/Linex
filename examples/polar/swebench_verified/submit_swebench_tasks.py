@@ -2,13 +2,12 @@
 """Submit SWE-bench Verified tasks to the Polar rollout server.
 
 Each task runs an agent in a per-instance container and is graded by the
-official `swebench` harness. Tasks are submitted at once; live progress and
-per-session detail are visible in the dashboard
-(`polar dashboard -c examples/swebench_verified/topology.vllm.yaml`).
+official `swebench` harness. Tasks are submitted at once and polled until each
+one finishes.
 
-    uv run python examples/swebench_verified/submit_swebench_tasks.py --harness claude_code --max-tasks 10
-    uv run python examples/swebench_verified/submit_swebench_tasks.py --harness codex --max-tasks 50 --num-samples 4
-    uv run python examples/swebench_verified/submit_swebench_tasks.py --harness claude_code --instance-id django__django-15098
+    uv run python examples/polar/swebench_verified/submit_swebench_tasks.py --harness claude_code --max-tasks 10
+    uv run python examples/polar/swebench_verified/submit_swebench_tasks.py --harness codex --max-tasks 50 --num-samples 4
+    uv run python examples/polar/swebench_verified/submit_swebench_tasks.py --harness claude_code --instance-id django__django-15098
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ from dataset import (
 )
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
-DEFAULT_TOPOLOGY = EXAMPLE_DIR / "topology.vllm.yaml"
+DEFAULT_TOPOLOGY = EXAMPLE_DIR / "topology.yaml"
 POLL_INTERVAL_SECONDS = 15.0
 
 # Pinned versions keep the quickstart stable. Bump intentionally.
@@ -175,7 +174,6 @@ def print_summary(stats: dict[str, tuple[int, int]], elapsed: float) -> None:
     for iid in sorted(stats):
         r1, total = stats[iid]
         print(f"  {iid:<45} {f'{r1}/{total}':>12}")
-    print("\n  Per-session detail: polar dashboard -c examples/swebench_verified/topology.vllm.yaml")
 
 
 def main() -> int:
@@ -211,7 +209,7 @@ def main() -> int:
             resp.raise_for_status()
             task_ids[iid] = resp.json()["task_id"]
 
-        print(f"Polling every {POLL_INTERVAL_SECONDS:.0f}s (watch live in the dashboard) ...")
+        print(f"Polling every {POLL_INTERVAL_SECONDS:.0f}s ...")
         t0 = time.monotonic()
         stats: dict[str, tuple[int, int]] = {}
         while len(stats) < len(task_ids):

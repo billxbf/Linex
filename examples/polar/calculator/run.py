@@ -3,12 +3,11 @@
 
 Each harness gets a tiny `calculator.py` with parser stubs, edits it, and the
 evaluator runs `python3 test_calculator.py`. All harnesses are submitted at
-once; live progress and per-session detail are visible in the dashboard
-(`polar dashboard -c examples/calculator/topology.vllm.yaml`).
+once and progress is reported while the rollout task API is polled.
 
-    uv run python examples/calculator/run.py                 # docker (default)
-    uv run python examples/calculator/run.py --backend apptainer
-    uv run python examples/calculator/run.py --harness codex # Codex-only smoke test
+    uv run python examples/polar/calculator/run.py                 # docker (default)
+    uv run python examples/polar/calculator/run.py --backend apptainer
+    uv run python examples/polar/calculator/run.py --harness codex # Codex-only smoke test
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ EXAMPLE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = EXAMPLE_DIR / "assets"
 TEST_FILE = ASSETS_DIR / "test_calculator.py"
 STARTER_FILE = ASSETS_DIR / "calculator.py"
-DEFAULT_TOPOLOGY = EXAMPLE_DIR / "topology.vllm.yaml"
+DEFAULT_TOPOLOGY = EXAMPLE_DIR / "topology.yaml"
 RUNTIME_IMAGE = "polar-localhost-calculator:latest"
 NUM_SAMPLES = 4
 # Generous budget: INIT install (npm / pip / venv) shares the per-task budget
@@ -253,7 +252,7 @@ def main() -> int:
             task_ids[harness] = resp.json()["task_id"]
             print(f"  {harness:<16} -> {task_ids[harness]}")
 
-        print(f"\nPolling every {POLL_INTERVAL_SECONDS:.0f}s (watch live in the dashboard) ...")
+        print(f"\nPolling every {POLL_INTERVAL_SECONDS:.0f}s ...")
         t0 = time.monotonic()
         finished: dict[str, dict[str, Any]] = {}
         while len(finished) < len(selected_harnesses):

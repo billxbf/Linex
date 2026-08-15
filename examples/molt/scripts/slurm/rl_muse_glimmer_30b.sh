@@ -79,4 +79,4 @@ export CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-$REPO_ROOT:/molt,/lustre:/lustre,$H
 # The base recipe keeps vllm_kl enabled and logged.
 # Slurm executes a spool copy of this wrapper, so resolve the shared launcher
 # from the submitted repository rather than from this file's runtime directory.
-exec bash "$REPO_ROOT/examples/scripts/slurm/rl_qwen3_6_35b.sh" "$@"
+exec bash "$REPO_ROOT/examples/molt/scripts/slurm/rl_qwen3_6_35b.sh" "$@"

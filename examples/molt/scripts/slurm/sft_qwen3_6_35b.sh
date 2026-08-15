@@ -43,7 +43,7 @@ MODEL_PATH="${MODEL_PATH:-/path/to/models/Qwen3.6-35B-A3B}"
 SFT_DATASET="${SFT_DATASET:-$REPO_ROOT/.tmp/geo3k/train}"
 EVAL_DATASET="${EVAL_DATASET:-$REPO_ROOT/.tmp/geo3k/eval}"
 if [ ! -d "$SFT_DATASET" ]; then
-  python3 "$REPO_ROOT/examples/python/utils/prepare_geo3k.py" \
+  python3 "$REPO_ROOT/examples/molt/python/utils/prepare_geo3k.py" \
     --max-eval 256 --num-proc 8 --out-dir "$REPO_ROOT/.tmp/geo3k"
 fi
 SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/sft-qwen3-6/$SLURM_JOB_ID}"

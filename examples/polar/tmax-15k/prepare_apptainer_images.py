@@ -11,7 +11,7 @@ Polar's ApptainerRuntime launches the ``.sif`` directly, so the Slurm nodes need
 no docker (only ``apptainer``). This step reads the images out of the local docker
 daemon (``docker-daemon://``), so it must run where the docker images live.
 
-    uv run python examples/tmax-15k/prepare_apptainer_images.py \
+    uv run python examples/polar/tmax-15k/prepare_apptainer_images.py \
         --dataset-dir ~/tmax15k --image-dir ~/tmax15k-sif --max-tasks 10
 """
 

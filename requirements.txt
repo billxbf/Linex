@@ -3,15 +3,19 @@ aiohttp
 datasets
 dion @ git+https://github.com/microsoft/dion.git
 einops
+fastapi>=0.115.0
 grpcio>=1.74.0
 huggingface_hub>=1.0.0
+httpx>=0.27.0
 jsonlines
 nemo-automodel @ git+https://github.com/NVIDIA-NeMo/Automodel.git@e8a163b97ff979d7bf779e0509eda20ce1c3557d
 optree>=0.15.0
 packaging
 peft
 pylatexenc
+pydantic>=2.9.0
 pynvml>=12.0.0
+pyyaml>=6.0
 ray[default]==2.55.0
 sympy
 tensorboard
@@ -20,6 +24,7 @@ torchdata
 torchmetrics
 tqdm
 transformers
+uvicorn>=0.30.0
 vllm
 vllm-router>=0.1.14
 wandb

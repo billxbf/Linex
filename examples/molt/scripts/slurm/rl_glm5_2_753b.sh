@@ -83,7 +83,7 @@ export ASYNC_QUEUE_SIZE="${ASYNC_QUEUE_SIZE:-1}"
 export ROUTING_REPLAY="${ROUTING_REPLAY:-1}"
 # Chat agent (loopback OpenAI SDK harness), NOT the STEP runner.
 # Text math Env agent (GLM-5.2 is text-only; the VLM chat_geo3k agent does not apply).
-export AGENT_PATH="${AGENT_PATH:-/molt/examples/python/agents/math.py}"
+export AGENT_PATH="${AGENT_PATH:-/molt/examples/molt/python/agents/math.py}"
 # Bounded run: don't persist a ~750B checkpoint (skip intermediate + final saves).
 export SAVE_STEPS="${SAVE_STEPS:-1000}"
 export DISABLE_FINAL_SAVE="${DISABLE_FINAL_SAVE:-1}"
@@ -136,7 +136,7 @@ if [ "$CHAIN_DEPTH" -lt "$CHAIN_MAX" ]; then
     ${SLURM_JOB_RESERVATION:+--reservation="$SLURM_JOB_RESERVATION"} \
     --nodes="$SLURM_JOB_NUM_NODES" \
     --comment="$SBATCH_COMMENT" \
-    "$REPO_ROOT/examples/scripts/slurm/rl_glm5_2.sh")
+    "$REPO_ROOT/examples/molt/scripts/slurm/rl_glm5_2.sh")
   echo "[chain] depth=$NEXT_DEPTH/$CHAIN_MAX next_jobid=$next_jobid"
 fi
 
@@ -159,14 +159,14 @@ MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to the VLM checkpoint to train.}"
 DEFAULT_DATA_DIR="$REPO_ROOT/.tmp/geo3k"
 if [ -z "${PROMPT_DATASET:-}" ] && [ ! -d "$DEFAULT_DATA_DIR/train" ]; then
   echo "[launcher] preparing geo3k VLM (VeraIsHere/geo3k_imgurl_processed) — one-time"
-  python3 "$REPO_ROOT/examples/python/utils/prepare_geo3k.py" \
+  python3 "$REPO_ROOT/examples/molt/python/utils/prepare_geo3k.py" \
     --max-eval 256 --num-proc 8 --out-dir "$DEFAULT_DATA_DIR"
 fi
 PROMPT_DATASET="${PROMPT_DATASET:-$DEFAULT_DATA_DIR/train}"
 EVAL_DATASET="${EVAL_DATASET:-$DEFAULT_DATA_DIR/eval}"
 
 SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/molt-async-visual-rl/$SLURM_JOB_ID}"
-AGENT_PATH="${AGENT_PATH:-/molt/examples/python/agents/geo3k.py}"
+AGENT_PATH="${AGENT_PATH:-/molt/examples/molt/python/agents/geo3k.py}"
 
 # R3 (rollout routing replay, PR#2797) + qwen3_5_moe te-native CP live on the
 # automodel-r3 checkout — point PYTHONPATH there so it wins over the container's

@@ -21,7 +21,7 @@
 # Multi-turn rollout uses the `<tool_call>` geo3k math grader (with a boxed
 # fallback that gives partial credit for raw `\boxed{}` answers).
 #
-#   MODEL_PATH=/path/to/Qwen3.6-35B-A3B bash examples/scripts/quick_start/rl_qwen3_6_35b.sh
+#   MODEL_PATH=/path/to/Qwen3.6-35B-A3B bash examples/molt/scripts/quick_start/rl_qwen3_6_35b.sh
 
 set -euo pipefail
 
@@ -33,7 +33,7 @@ MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to a Qwen3.6-35B-A3B checkpoint.}"
 DATA_DIR="$REPO_ROOT/.tmp/geo3k"
 if [ ! -d "$DATA_DIR/train" ]; then
   echo "[quickstart] preparing geo3k VLM (VeraIsHere/geo3k_imgurl_processed) — one-time"
-  python3 "$REPO_ROOT/examples/python/utils/prepare_geo3k.py" \
+  python3 "$REPO_ROOT/examples/molt/python/utils/prepare_geo3k.py" \
     --max-eval 256 --num-proc 8 --out-dir "$DATA_DIR"
 fi
 PROMPT_DATASET="${PROMPT_DATASET:-$DATA_DIR/train}"
@@ -115,7 +115,7 @@ python3 -u -m molt.cli.train_rl_ray \
   --algo.kl.estimator k2 \
   --algo.kl.init_coef 0.0 \
   --reward.clip_range -10 10 \
-  --train.agent_path "$REPO_ROOT/examples/python/agents/geo3k.py" \
+  --train.agent_path "$REPO_ROOT/examples/molt/python/agents/geo3k.py" \
   --eval.dataset "$EVAL_DATASET" \
   --eval.steps 5 \
   --eval.n_samples_per_prompt 1 \

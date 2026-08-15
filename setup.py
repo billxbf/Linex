@@ -99,10 +99,10 @@ setup(
         "vllm": ["vllm==0.27.1"],
         "vllm_latest": ["vllm>=0.24.0"],
         "flash-attn-2": ["flash-attn==2.8.3"],
+        "swebench": ["swebench"],
     },
-    python_requires=">=3.10",
+    python_requires=">=3.11",
     classifiers=[
-        "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
         "Environment :: GPU :: NVIDIA CUDA",

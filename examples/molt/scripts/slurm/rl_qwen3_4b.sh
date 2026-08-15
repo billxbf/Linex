@@ -53,7 +53,7 @@ export FSDP_ATTN_IMPLEMENTATION="${FSDP_ATTN_IMPLEMENTATION:-flash_attention_2}"
 export VLLM_ENABLE_EXPERT_PARALLEL=0
 export FREEZE_VISUAL_ENCODER=0
 
-export AGENT_PATH="${AGENT_PATH:-/molt/examples/python/agents/math.py}"
+export AGENT_PATH="${AGENT_PATH:-/molt/examples/molt/python/agents/math.py}"
 export MAX_AGENT_TURNS="${MAX_AGENT_TURNS:-1}"
 
 export PROMPT_DATASET="${PROMPT_DATASET:-$REPO_ROOT/.tmp/proRL_text_rl/train}"
@@ -87,7 +87,7 @@ MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to the VLM checkpoint to train.}"
 test -n "${PROMPT_DATASET:-}"
 
 SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/molt-async-visual-rl/$SLURM_JOB_ID}"
-AGENT_PATH="${AGENT_PATH:-/molt/examples/python/agents/math.py}"
+AGENT_PATH="${AGENT_PATH:-/molt/examples/molt/python/agents/math.py}"
 
 # Default the AutoModel source override to the sibling checkout if it exists, so
 # the latest main wins over the version baked into the container image.

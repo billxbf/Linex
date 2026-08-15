@@ -48,7 +48,7 @@ MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/.tmp/nemotron_omni_v3_shim/iter_0001926_mco
 SFT_DATASET="${SFT_DATASET:-$REPO_ROOT/.tmp/geo3k/train}"
 EVAL_DATASET="${EVAL_DATASET:-$REPO_ROOT/.tmp/geo3k/eval}"
 if [ ! -d "$SFT_DATASET" ]; then
-  python3 "$REPO_ROOT/examples/python/utils/prepare_geo3k.py" \
+  python3 "$REPO_ROOT/examples/molt/python/utils/prepare_geo3k.py" \
     --max-eval 256 --num-proc 8 --out-dir "$REPO_ROOT/.tmp/geo3k"
 fi
 SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/sft-omni3/$SLURM_JOB_ID}"

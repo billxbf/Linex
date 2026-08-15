@@ -19,7 +19,7 @@
 # 8 GPUs on one machine via torchrun --standalone — no slurm.
 # Mirrors slurm/sft_qwen3_4b.sh's recipe for single-node use.
 #
-#   MODEL_PATH=/path/to/Qwen3-4B bash examples/scripts/quick_start/sft_qwen3_4b.sh
+#   MODEL_PATH=/path/to/Qwen3-4B bash examples/molt/scripts/quick_start/sft_qwen3_4b.sh
 
 set -euo pipefail
 

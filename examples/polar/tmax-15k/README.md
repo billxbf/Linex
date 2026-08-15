@@ -38,7 +38,7 @@ Per task we build the sandbox from its `environment/Dockerfile`, then layer
 Node.js (`runtime/Dockerfile`) so the harness CLI can run inside it:
 
 ```bash
-uv run python examples/tmax-15k/build_images.py --dataset-dir ~/tmax15k --max-tasks 10
+uv run python examples/polar/tmax-15k/build_images.py --dataset-dir ~/tmax15k --max-tasks 10
 ```
 
 ### 3. Start two inference servers (Qwen3.6-27B)
@@ -53,12 +53,12 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 uv run vllm serve Qwen/Qwen3.6-27B --port 8001 \
   --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
 ```
 
-### 4. Start Polar
+### 4. Start Polar services
 
 ```bash
-uv run polar serve_rollout -c examples/tmax-15k/topology.vllm.yaml
-uv run polar serve_gateway -c examples/tmax-15k/topology.vllm.yaml --node-id localhost-node-01
-uv run polar serve_gateway -c examples/tmax-15k/topology.vllm.yaml --node-id localhost-node-02
+POLAR_TOPOLOGY=examples/polar/tmax-15k/topology.yaml uv run python -m polar.rollout.server
+POLAR_TOPOLOGY=examples/polar/tmax-15k/topology.yaml POLAR_GATEWAY_NODE_ID=localhost-node-01 uv run python -m polar.gateway.server
+POLAR_TOPOLOGY=examples/polar/tmax-15k/topology.yaml POLAR_GATEWAY_NODE_ID=localhost-node-02 uv run python -m polar.gateway.server
 ```
 
 ### 5. Submit tasks
@@ -68,18 +68,12 @@ Supported harnesses: `codex`, `claude_code`, `opencode`, `qwen_code`, `pi`, `her
 
 ```bash
 # pass@4 over the first 10 tasks
-uv run python examples/tmax-15k/submit_tmax_tasks.py --dataset-dir ~/tmax15k --harness hermes --max-tasks 10 --num-samples 4
+uv run python examples/polar/tmax-15k/submit_tmax_tasks.py --dataset-dir ~/tmax15k --harness hermes --max-tasks 10 --num-samples 4
 ```
 
 Use Apptainer instead of Docker with `--runtime-backend apptainer` (this still
 reads images from a local docker daemon). For nodes **without Docker**, see
 [Docker-free runs](#docker-free-runs-apptainer-on-slurm) below.
-
-### 6. (Optional) Watch in the dashboard
-
-```bash
-uv run polar dashboard -c examples/tmax-15k/topology.vllm.yaml   # http://127.0.0.1:8090
-```
 
 ## Docker-free runs (Apptainer on Slurm)
 
@@ -90,12 +84,12 @@ them over, and launch the `.sif` directly — Polar's `ApptainerRuntime` needs o
 
 ```bash
 # on a box WITH docker — build images, then snapshot them to .sif
-uv run python examples/tmax-15k/build_images.py --dataset-dir ~/tmax15k --max-tasks 10
-uv run python examples/tmax-15k/prepare_apptainer_images.py \
+uv run python examples/polar/tmax-15k/build_images.py --dataset-dir ~/tmax15k --max-tasks 10
+uv run python examples/polar/tmax-15k/prepare_apptainer_images.py \
   --dataset-dir ~/tmax15k --image-dir ~/tmax15k-sif --max-tasks 10
 
 # copy ~/tmax15k-sif/ to the cluster, then on Slurm (no docker needed):
-uv run python examples/tmax-15k/submit_tmax_tasks.py --dataset-dir ~/tmax15k \
+uv run python examples/polar/tmax-15k/submit_tmax_tasks.py --dataset-dir ~/tmax15k \
   --harness hermes --max-tasks 10 \
   --runtime-backend apptainer --apptainer-image-dir ~/tmax15k-sif
 ```

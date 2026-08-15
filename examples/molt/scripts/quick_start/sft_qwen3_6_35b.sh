@@ -19,7 +19,7 @@
 # 8 GPUs on one machine via torchrun --standalone — no slurm.
 # Mirrors slurm/sft_qwen3_6_35b.sh's recipe for single-node use.
 #
-#   MODEL_PATH=/path/to/Qwen3.6-35B-A3B bash examples/scripts/quick_start/sft_qwen3_6_35b.sh
+#   MODEL_PATH=/path/to/Qwen3.6-35B-A3B bash examples/molt/scripts/quick_start/sft_qwen3_6_35b.sh
 
 set -euo pipefail
 
@@ -31,7 +31,7 @@ MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to a Qwen3.6-35B-A3B checkpoint.}"
 DATA_DIR="$REPO_ROOT/.tmp/geo3k"
 if [ ! -d "$DATA_DIR/train" ]; then
   echo "[quickstart] preparing geo3k VLM (VeraIsHere/geo3k_imgurl_processed) — one-time"
-  python3 "$REPO_ROOT/examples/python/utils/prepare_geo3k.py" \
+  python3 "$REPO_ROOT/examples/molt/python/utils/prepare_geo3k.py" \
     --max-eval 256 --num-proc 8 --out-dir "$DATA_DIR"
 fi
 SFT_DATASET="${SFT_DATASET:-$DATA_DIR/train}"

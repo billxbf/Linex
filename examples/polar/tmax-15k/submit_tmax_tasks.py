@@ -5,9 +5,9 @@ Each task runs a coding-agent harness inside the task's container, then the
 ``harbor`` evaluator injects the task's ``tests/`` and runs ``test.sh`` —
 reproducing TMax's reward (1.0 = ``test_final_state.py`` passed, else 0.0).
 
-    uv run python examples/tmax-15k/submit_tmax_tasks.py --dataset-dir <dir> --harness codex --max-tasks 10
-    uv run python examples/tmax-15k/submit_tmax_tasks.py --dataset-dir <dir> --harness claude_code --num-samples 4
-    uv run python examples/tmax-15k/submit_tmax_tasks.py --dataset-dir <dir> --harness codex --task task_000123_ab12cd34
+    uv run python examples/polar/tmax-15k/submit_tmax_tasks.py --dataset-dir <dir> --harness codex --max-tasks 10
+    uv run python examples/polar/tmax-15k/submit_tmax_tasks.py --dataset-dir <dir> --harness claude_code --num-samples 4
+    uv run python examples/polar/tmax-15k/submit_tmax_tasks.py --dataset-dir <dir> --harness codex --task task_000123_ab12cd34
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from dataset import (
 )
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
-DEFAULT_TOPOLOGY = EXAMPLE_DIR / "topology.vllm.yaml"
+DEFAULT_TOPOLOGY = EXAMPLE_DIR / "topology.yaml"
 POLL_INTERVAL_SECONDS = 15.0
 
 # Per-harness INIT install command. The Node CLIs install globally. hermes and
@@ -197,7 +197,6 @@ def print_summary(stats: dict[str, tuple[int, int]], elapsed: float) -> None:
     for name in sorted(stats):
         r1, total = stats[name]
         print(f"  {name:<45} {f'{r1}/{total}':>12}")
-    print(f"\n  Per-session detail: polar dashboard -c {DEFAULT_TOPOLOGY}")
 
 
 def main() -> int:
@@ -235,7 +234,7 @@ def main() -> int:
             resp.raise_for_status()
             task_ids[task.name] = resp.json()["task_id"]
 
-        print(f"Polling every {POLL_INTERVAL_SECONDS:.0f}s (watch live in the dashboard) ...")
+        print(f"Polling every {POLL_INTERVAL_SECONDS:.0f}s ...")
         t0 = time.monotonic()
         stats: dict[str, tuple[int, int]] = {}
         while len(stats) < len(task_ids):
