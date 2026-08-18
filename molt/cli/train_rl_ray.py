@@ -17,7 +17,11 @@
 # Copyright (c) OpenRLHF contributors, licensed under the Apache License, Version 2.0.
 
 import argparse
+import atexit
 import os
+from pathlib import Path
+
+import yaml
 
 from molt.trainer.algorithm.experience import get_model_parallel_size
 
@@ -111,19 +115,102 @@ def train(args):
             data_parallel_size=getattr(args.vllm, "data_parallel_size", 1),
         )
 
-    # Rollout gateway: serve each engine's OpenAI API + the real vllm-router in front of them.
-    # Rollouts run through a runner pool -> gateway (generation); weight sync still goes straight to
-    # the engine workers (bypasses the gateway). Built before the FSDP models so --eval.eval_only can
-    # score a checkpoint and return here without ever creating a policy actor.
+    # Serve each engine's OpenAI API behind one router. Polar sends supported
+    # rollouts through it; weight sync still goes straight to the engine workers.
     router_url = None
-    vllm_router = None  # MUST stay in scope for the whole run — the router actor dies if GC'd
+    _vllm_router = None  # MUST stay in scope for the whole run — the router actor dies if GC'd
     if vllm_engines:
         from molt.trainer.rollout.router import create_vllm_router
 
-        vllm_router, router_url = create_vllm_router(
-            vllm_engines, policy=getattr(args.vllm, "router_policy", "consistent_hash")
+        _vllm_router, router_url = create_vllm_router(
+            vllm_engines,
+            policy=getattr(args.vllm, "router_policy", "consistent_hash"),
+            tool_call_parser=args.vllm.tool_call_parser,
+            reasoning_parser=args.vllm.reasoning_parser,
         )
-        print(f"[rollout] gateway up at {router_url} fronting {len(vllm_engines)} engines", flush=True)
+        print(f"[rollout] vLLM router up at {router_url} fronting {len(vllm_engines)} engines", flush=True)
+
+    polar_rollout = None
+    polar_gateways = []
+
+    def close_rollout_services():
+        nonlocal polar_rollout, polar_gateways, _vllm_router
+        rollout = polar_rollout
+        gateways = polar_gateways
+        router = _vllm_router
+        polar_rollout = None
+        polar_gateways = []
+        _vllm_router = None
+        if rollout is None and not gateways and router is None:
+            return
+        try:
+            if gateways:
+                ray.get([gateway.close.remote() for gateway in gateways])
+        finally:
+            try:
+                if rollout is not None:
+                    ray.get(rollout.close.remote())
+            finally:
+                if router is not None:
+                    ray.get(router.close.remote())
+
+    atexit.register(close_rollout_services)
+
+    if not args.train.agent_path:
+        from molt.trainer.rollout.polar import PolarServiceActor
+        from polar.config import TopologyConfig
+
+        try:
+            for index in range(args.rollout.gateway_count):
+                polar_gateways.append(
+                    PolarServiceActor.options(scheduling_strategy="SPREAD").remote("gateway", f"gateway-{index}")
+                )
+            gateway_nodes = ray.get([gateway.descriptor.remote() for gateway in polar_gateways])
+            polar_rollout = PolarServiceActor.remote("rollout")
+            rollout_node = ray.get(polar_rollout.descriptor.remote())
+            topology = TopologyConfig.model_validate(
+                {
+                    "rollout": {
+                        "host": rollout_node["host"],
+                        "port": rollout_node["port"],
+                        "public_url": rollout_node["url"],
+                        "save_dir": str(Path(args.rollout.save_dir).resolve()),
+                    },
+                    "gateway": {
+                        "rollout_server_url": rollout_node["url"],
+                        "nodes": [
+                            {
+                                "id": node["node_id"],
+                                "host": node["host"],
+                                "port": node["port"],
+                                "public_url": node["url"],
+                                "model_served": "policy",
+                                "inference": {"base_url": router_url},
+                                "max_init_workers": args.rollout.gateway_concurrency,
+                                "max_run_workers": args.rollout.gateway_concurrency,
+                                "max_postrun_workers": 2 * args.rollout.gateway_concurrency,
+                            }
+                            for node in gateway_nodes
+                        ],
+                    },
+                }
+            )
+            save_dir = Path(args.rollout.save_dir).resolve()
+            save_dir.mkdir(parents=True, exist_ok=True)
+            topology_path = save_dir / "topology.json"
+            topology_path.write_text(topology.model_dump_json(indent=2, exclude={"path"}) + "\n")
+            topology_payload = topology.model_dump(mode="json", exclude={"path"})
+            ray.get(polar_rollout.start.remote(topology_payload))
+            ray.get([gateway.start.remote(topology_payload) for gateway in polar_gateways])
+            ray.get(polar_rollout.ready.remote(len(polar_gateways)))
+        except Exception:
+            close_rollout_services()
+            raise
+        print(
+            f"[rollout] Polar ready at {rollout_node['url']} with {len(polar_gateways)} gateways; "
+            f"topology saved to {topology_path}",
+            flush=True,
+        )
 
     from molt.trainer.rl_trainer import RLTrainer
 
@@ -142,9 +229,20 @@ def train(args):
     if args.eval.eval_only:
         assert args.eval.dataset, "--eval.eval_only requires --eval.dataset."
         eval_trainer = RLTrainer.remote(
-            args.actor.model_name_or_path, strategy, None, None, vllm_engines, router_url=router_url, **gen_kwargs
+            args.actor.model_name_or_path,
+            strategy,
+            None,
+            None,
+            vllm_engines,
+            router_url=router_url,
+            polar_rollout=polar_rollout,
+            polar_gateways=polar_gateways,
+            **gen_kwargs,
         )
-        print(f"[eval-only] {ray.get(eval_trainer.run_eval_only.remote())}", flush=True)
+        try:
+            print(f"[eval-only] {ray.get(eval_trainer.run_eval_only.remote())}", flush=True)
+        finally:
+            close_rollout_services()
         return
 
     # init actor / reference / critic models
@@ -242,6 +340,8 @@ def train(args):
         vllm_engines,
         critic_model_group=critic_model,
         router_url=router_url,
+        polar_rollout=polar_rollout,
+        polar_gateways=polar_gateways,
         **gen_kwargs,
     )
 
@@ -268,12 +368,12 @@ def train(args):
         refs.extend(critic_model.async_init_model_from_pretrained(strategy, args.actor.model_name_or_path, max_steps))
     ray.get(refs)
 
-    # train actor model
-    ray.get(policy_trainer.fit.remote())
-
-    # save model
-    if not args.ckpt.disable_final_save:
-        ray.get(actor_model.async_export_hf_model())
+    try:
+        ray.get(policy_trainer.fit.remote())
+        if not args.ckpt.disable_final_save:
+            ray.get(actor_model.async_export_hf_model())
+    finally:
+        close_rollout_services()
 
 
 if __name__ == "__main__":
@@ -409,6 +509,12 @@ if __name__ == "__main__":
         help="Dataset key whose value is a list of OpenAI function-call schemas; rendered "
         "into the chat template (see Qwen `tools=`) so the model is taught the native "
         "<tool_call>{...}</tool_call> emission format without manual prompt engineering.",
+    )
+    parser.add_argument(
+        "--data.task_key",
+        type=str,
+        default="task",
+        help="Dataset column containing a complete Polar task specification for that row.",
     )
     parser.add_argument(
         "--data.apply_chat_template",
@@ -556,6 +662,12 @@ if __name__ == "__main__":
 
     # Rollout / generation
     parser.add_argument("--train.agent_path", type=str, default=None, help="Agent script path")
+    parser.add_argument(
+        "--rollout.task_spec",
+        type=str,
+        default=None,
+        help="Polar runtime, agent, builder, and evaluator YAML; optional when every dataset row has --data.task_key.",
+    )
     # -- vLLM engine --
     parser.add_argument(
         "--vllm.num_engines", type=int, default=None, help="number of vLLM Engines, set to 0 to disable vLLM"
@@ -586,6 +698,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--vllm.sync_backend", type=str, default="nccl", help="trainer -> vLLM weight sync backend")
     parser.add_argument("--vllm.enforce_eager", action="store_true", default=False, help="Disable CUDA graph in vLLM")
+    parser.add_argument(
+        "--vllm.tool_call_parser",
+        type=str,
+        default=None,
+        help="vLLM parser for model-emitted tool calls, for example qwen3_coder.",
+    )
+    parser.add_argument(
+        "--vllm.reasoning_parser",
+        type=str,
+        default=None,
+        help="vLLM parser for model reasoning output, for example qwen3.",
+    )
     parser.add_argument(
         "--vllm.router_policy",
         type=str,
@@ -715,11 +839,30 @@ if __name__ == "__main__":
     )
     # -- sampling & rollout batching --
     parser.add_argument("--rollout.batch_size", type=int, default=1024, help="Batch size for make experience")
+    parser.add_argument("--rollout.gateway_count", type=int, default=2, help="Number of Ray-managed Polar gateways")
+    parser.add_argument(
+        "--rollout.gateway_concurrency",
+        type=int,
+        default=2,
+        help="Concurrent container sessions per Polar gateway stage",
+    )
+    parser.add_argument(
+        "--rollout.session_timeout",
+        type=float,
+        default=600.0,
+        help="End-to-end timeout in seconds for each Polar session",
+    )
+    parser.add_argument(
+        "--rollout.save_dir",
+        type=str,
+        default="./rollout_results",
+        help="Directory for Polar results and the generated runtime topology",
+    )
     parser.add_argument(
         "--rollout.num_runners",
         type=int,
         default=2,
-        help="Router path: number of runner-pool actors (rollouts + in-process reward grading)",
+        help="Frozen R3/VLM path: number of legacy runner actors",
     )
     parser.add_argument(
         "--rollout.vllm_generate_batch_size", type=int, default=None, help="Batch size for vLLM generating samples"
@@ -900,6 +1043,17 @@ if __name__ == "__main__":
             "actor-side generation fallback is not wired in this AutoModel path."
         )
 
+    args.rollout.task = None
+    if args.rollout.task_spec:
+        from polar.rollout.models import TaskSpec
+
+        task_path = Path(args.rollout.task_spec).resolve()
+        with task_path.open() as task_file:
+            task_payload = yaml.safe_load(task_file) or {}
+        args.rollout.task = TaskSpec.model_validate(
+            task_payload, context={"base_dir": task_path.parent}
+        ).model_dump(mode="json")
+
     # --- Algorithm setup & defaults ---
     if args.actor.eps_clip_low_high is None:
         # Default to the standard symmetric PPO clip; every launch script passes
@@ -928,8 +1082,43 @@ if __name__ == "__main__":
         args.algo.kl.init_coef = 0.01
 
     # --- Agent / rollout ---
+    legacy_rollout = (
+        args.train.routing_replay
+        or args.data.max_images_per_prompt > 0
+        or args.algo.advantage.estimator == "on_policy_distill"
+    )
+    if args.rollout.task_spec:
+        if args.train.routing_replay:
+            raise NotImplementedError("R3 routing replay through Polar is deferred.")
+        if args.data.max_images_per_prompt > 0:
+            raise NotImplementedError("VLM rollout through Polar is deferred; use a text-only task specification.")
+        if args.algo.advantage.estimator == "on_policy_distill":
+            raise NotImplementedError("Container-based on-policy distillation through Polar is deferred.")
+        if args.train.agent_path:
+            raise ValueError("Use --rollout.task_spec for Polar rollout; do not also set --train.agent_path.")
+    elif args.train.agent_path:
+        if not legacy_rollout:
+            raise ValueError(
+                "Direct text-agent rollout is no longer supported; configure --rollout.task_spec for Polar."
+            )
+    elif args.train.routing_replay:
+        raise NotImplementedError("R3 rollout through Polar is deferred; the frozen path requires --train.agent_path.")
+    elif args.data.max_images_per_prompt > 0:
+        raise NotImplementedError(
+            "VLM rollout through Polar is deferred; the frozen path requires --train.agent_path."
+        )
+
     if not args.train.agent_path:
-        raise ValueError("--train.agent_path is required for non-critic RL")
+        if args.data.apply_chat_template:
+            raise ValueError("Polar datasets supply plain task instructions; remove --data.apply_chat_template.")
+        if not args.vllm.tool_call_parser:
+            raise ValueError("Polar rollout requires --vllm.tool_call_parser (for example qwen3_coder).")
+        if args.vllm.router_policy != "consistent_hash":
+            raise ValueError("Polar rollout requires --vllm.router_policy consistent_hash for session affinity.")
+        if args.rollout.gateway_count <= 0 or args.rollout.gateway_concurrency <= 0:
+            raise ValueError("Polar gateway count and concurrency must both be positive.")
+        if args.rollout.session_timeout <= 0:
+            raise ValueError("--rollout.session_timeout must be positive.")
 
     # Set vLLM generate_batch_size to rollout_batch_size if not specified
     if not args.rollout.vllm_generate_batch_size:
@@ -952,17 +1141,13 @@ if __name__ == "__main__":
         assert args.algo.dynamic_filtering_range[0] < args.algo.dynamic_filtering_range[1], (
             "dynamic_filtering_range[0] must be less than dynamic_filtering_range[1]"
         )
-        assert args.train.agent_path, "--train.agent_path must be specified when using dynamic filtering"
         assert args.rollout.n_samples_per_prompt > 1, (
             "n_samples_per_prompt must be greater than 1 when using dynamic filtering"
         )
 
     if args.algo.advantage.is_correction_level == "off":
-        # The HTTP router path can't observe a mid-request weight swap, so off_policy_len is always 0
-        # (no slime-style masking of stale-weight tokens). Async rollout (crosses broadcasts between
-        # requests) and partial rollout (preempts mid-request at every weight sync) both then feed
-        # off-policy tokens into the loss uncorrected AND unmasked -> fail fast instead of silently
-        # biasing the update. Per-token IS (is_correction_level != off) is the correction that replaces it.
+        # The HTTP path has no per-token policy-boundary mask. Async and partial
+        # rollout can cross broadcasts between requests, so require IS correction.
         if args.train.async_queue_size > 1 or args.train.partial_rollout_enable:
             raise ValueError(
                 "Off-policy rollout (--train.async_queue_size > 1 or --train.partial_rollout_enable) "
@@ -972,16 +1157,16 @@ if __name__ == "__main__":
                 "AND --train.force_sync_mode, no --train.partial_rollout_enable). Note: async_queue_size 1 "
                 "alone frees the rollout slot before the refit, so the next batch is still 1-step stale."
             )
-        print(
-            "[Warning] Rollout samples may be off-policy. Set "
-            "--algo.advantage.is_correction_level (token|seq|geo) to correct rollout logprobs during training."
-        )
+        if not args.train.force_sync_mode:
+            print(
+                "[Warning] Rollout samples may be off-policy. Set "
+                "--algo.advantage.is_correction_level (token|seq|geo) to correct rollout logprobs during training."
+            )
     elif args.train.partial_rollout_enable:
-        # IS is on, so the off-policy tokens are corrected; note only that slime-style MASKING is not.
+        # A session may continue under new weights after a drained broadcast.
         print(
-            "[Warning] --train.partial_rollout_enable: slime-style off-policy token MASKING "
-            "(off_policy_len) is INACTIVE on the HTTP router path — the transport can't observe a "
-            "mid-request weight swap. Per-token IS is correcting those tokens instead."
+            "[Warning] --train.partial_rollout_enable can continue sessions across weight broadcasts. "
+            "Per-token IS is correcting those off-policy tokens."
         )
 
     if args.algo.advantage.is_correction_level != "off" and args.rollout.top_p < 1.0:
@@ -1077,9 +1262,6 @@ if __name__ == "__main__":
     ), "The number of sample batches must be greater than or equal to the effective number of actor processes."
 
     # --- Eval ---
-    if args.eval.dataset:
-        assert args.train.agent_path, "`--eval.dataset` requires `--train.agent_path`."
-
     if args.eval.batch_size is not None and args.eval.batch_size <= 0:
         raise ValueError(f"--eval.batch_size must be greater than zero, got {args.eval.batch_size}.")
 

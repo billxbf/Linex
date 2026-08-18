@@ -24,7 +24,6 @@ import torch
 from ray.util.queue import Queue
 from tqdm import tqdm
 
-from molt.agents.base import _first_scalar
 from molt.datasets import PromptDataset
 from molt.datasets.utils import blending_datasets
 from molt.trainer.algorithm.experience import balance_experiences
@@ -36,7 +35,7 @@ from molt.trainer.vllm.vllm_engine import batch_vllm_engine_call
 from molt.trainer.workers.actor_group import RayActorGroup
 from molt.utils.distributed_sampler import DistributedSampler
 from molt.utils.logging_utils import TensorboardLogger, WandbLogger, init_logger
-from molt.utils.utils import get_tokenizer
+from molt.utils.utils import first_scalar, get_tokenizer
 
 logger = init_logger(__name__)
 
@@ -44,16 +43,12 @@ logger = init_logger(__name__)
 def prepare_datasets(strategy, tokenizer):
     args = strategy.args
 
-    # BOTH runner types consume the SAME chat-format dataset (--data.apply_chat_template);
-    # Runner.PRERENDER_PROMPT only decides WHERE the template is applied. The step runner needs the
-    # dataset to pre-render; the chat runner hands the raw messages to the chat server, which renders
-    # them exactly once with the model's own template (a dataset pre-render would double-template and
-    # drop the image on structured-content VLMs) — so for chat agents the flag is required, never
-    # applied dataset-side.
-    from molt.agents.base import load_agent_runner
-
+    # Polar consumes plain task instructions. Only the frozen legacy path loads
+    # a Molt runner to decide whether its chat messages are rendered here.
     prerender = True
     if getattr(args.train, "agent_path", None):
+        from molt.agents.base import load_agent_runner
+
         prerender = getattr(load_agent_runner(args.train.agent_path), "PRERENDER_PROMPT", True)
     if not prerender and not args.data.apply_chat_template:
         raise ValueError(
@@ -168,7 +163,7 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
         return {}
 
     prompt_to_datasource = {}
-    for datasources, prompts, _labels, _images, _tools in eval_dataloader:
+    for datasources, prompts, _labels, _images, _tools, _task_specs in eval_dataloader:
         for prompt, datasource in zip(prompts, datasources):
             if isinstance(prompt, list):
                 # Chat rows pass through as messages; key on the last user turn's text —
@@ -197,9 +192,9 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
             grouped[key] = {"rewards": [], "lengths": [], "truncated": []}
             group_order.append(key)
             group_prompt[key] = prompt
-        grouped[key]["rewards"].append(_first_scalar(s.rewards))
-        grouped[key]["lengths"].append(_first_scalar(s.response_length))
-        grouped[key]["truncated"].append(_first_scalar(s.truncated))
+        grouped[key]["rewards"].append(first_scalar(s.rewards))
+        grouped[key]["lengths"].append(first_scalar(s.response_length))
+        grouped[key]["truncated"].append(first_scalar(s.truncated))
 
     metrics = {}
     for key in group_order:
@@ -602,44 +597,38 @@ class GenerateSamplesActor:
         rollout_queue,
         rollout_slots,
         router_url=None,
+        polar_rollout=None,
         **generate_kwargs,
     ):
-        # No vllm_engines here: generation runs through the vllm-router via the runner
-        # actors below; only the TrainingActor touches the engines (pause/refit/resume).
+        # Only the TrainingActor touches vLLM engines directly for pause/refit/resume.
         self.args = strategy.args
 
         tokenizer = get_tokenizer(pretrain, None, "left", use_fast=not strategy.args.data.disable_fast_tokenizer)
         self.prompts_dataloader, self.eval_dataloader, self.max_steps = prepare_datasets(strategy, tokenizer)
         self.generate_kwargs = generate_kwargs
 
-        # Rollout runs on a list of runner actors -> the shared vllm-router (generation),
-        # grading in-process. Weight sync goes straight to the engines (bypasses the router).
-        from molt.trainer.rollout.router import AgentRunnerActor
+        # Polar owns supported rollout sessions. Runner actors remain only for
+        # the frozen R3/VLM/distillation path.
+        agent_runners = None
+        if polar_rollout is None:
+            from molt.trainer.rollout.router import AgentRunnerActor
 
-        num_runners = max(1, getattr(strategy.args.rollout, "num_runners", 2))
-        # SPREAD the runners across the cluster. AgentRunnerActor already asks for num_cpus=1 so
-        # that Ray *can* balance it, and the comment on that decorator assumes SPREAD is in
-        # effect -- but nothing ever passed it, and Ray's default packs onto the first node with
-        # room. A node with dozens of free CPUs has room for every runner, so all of them land
-        # there, and so do all of their desktop-env VMs.
-        #
-        # Measured on an OSWorld run: every AgentRunnerActor reported the same ip, putting 128
-        # containers on one node. That node hands out 128 x 4 ports from the provider's ranges,
-        # which is where port collisions begin; osworld_error climbed 4% -> 54% within eleven
-        # steps while mean episode length fell 63 -> 19, i.e. rollouts dying at setup.
-        agent_runners = [
-            AgentRunnerActor.options(scheduling_strategy="SPREAD").remote(
-                strategy.args.train.agent_path, router_url, model_path=pretrain
-            )
-            for _ in range(num_runners)
-        ]
-        ray.get([r.ready.remote() for r in agent_runners])
+            num_runners = max(1, getattr(strategy.args.rollout, "num_runners", 2))
+            agent_runners = [
+                AgentRunnerActor.options(scheduling_strategy="SPREAD").remote(
+                    strategy.args.train.agent_path, router_url, model_path=pretrain
+                )
+                for _ in range(num_runners)
+            ]
+            ray.get([runner.ready.remote() for runner in agent_runners])
         self.samples_generator = SamplesGenerator(
             strategy=strategy,
             prompts_dataloader=self.prompts_dataloader,
             eval_dataloader=self.eval_dataloader,
             tokenizer=tokenizer,
             agent_runners=agent_runners,
+            polar_rollout=polar_rollout,
+            task_spec=getattr(strategy.args.rollout, "task", None),
         )
 
         self.vllm_lock = vllm_lock
@@ -836,6 +825,7 @@ class TrainingActor(BaseRLTrainer):
         vllm_lock,
         rollout_queue,
         rollout_slots,
+        polar_gateways=None,
         critic_model_group=None,
     ):
         tokenizer = get_tokenizer(pretrain, None, "left", use_fast=not strategy.args.data.disable_fast_tokenizer)
@@ -851,6 +841,8 @@ class TrainingActor(BaseRLTrainer):
 
         self.vllm_lock = vllm_lock
         self._prefix_caching_enabled = getattr(strategy.args.vllm, "enable_prefix_caching", False)
+        self._gateway_pause_timeout = strategy.args.rollout.session_timeout
+        self.polar_gateways = polar_gateways or []
         self.rollout_queue = rollout_queue
         self.rollout_slots = rollout_slots
 
@@ -933,15 +925,24 @@ class TrainingActor(BaseRLTrainer):
         ray.get(self.vllm_lock.acquire.remote())
         self._broadcast_lock_wait_s = time.time() - _t0
         _t0 = time.time()
+        engines_paused = False
         try:
+            ray.get([gateway.pause.remote(self._gateway_pause_timeout) for gateway in self.polar_gateways])
+            engines_paused = True
             batch_vllm_engine_call(self.vllm_engines, "pause_generation")
             super().broadcast_to_vllm()
             if self._prefix_caching_enabled:
                 batch_vllm_engine_call(self.vllm_engines, "reset_prefix_cache")
-            batch_vllm_engine_call(self.vllm_engines, "resume_generation")
         finally:
-            ray.get(self.vllm_lock.release.remote())
-            self._broadcast_transfer_s = time.time() - _t0
+            try:
+                if engines_paused:
+                    batch_vllm_engine_call(self.vllm_engines, "resume_generation")
+            finally:
+                try:
+                    ray.get([gateway.resume.remote() for gateway in self.polar_gateways])
+                finally:
+                    ray.get(self.vllm_lock.release.remote())
+                    self._broadcast_transfer_s = time.time() - _t0
 
 
 @ray.remote
@@ -956,7 +957,9 @@ class RLTrainer:
         reference_model_group: RayActorGroup,
         vllm_engines,
         critic_model_group: RayActorGroup = None,
-        router_url: str = None,
+        router_url: str | None = None,
+        polar_rollout=None,
+        polar_gateways=None,
         **generate_kwargs,
     ) -> None:
         if strategy.args.eval.steps == -1:
@@ -983,6 +986,7 @@ class RLTrainer:
             rollout_queue=self.rollout_queue,
             rollout_slots=self.rollout_slots,
             router_url=router_url,
+            polar_rollout=polar_rollout,
             **generate_kwargs,
         )
 
@@ -999,6 +1003,7 @@ class RLTrainer:
                 vllm_lock=vllm_lock,
                 rollout_queue=self.rollout_queue,
                 rollout_slots=self.rollout_slots,
+                polar_gateways=polar_gateways,
                 critic_model_group=critic_model_group,
             )
 

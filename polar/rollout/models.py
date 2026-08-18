@@ -56,6 +56,18 @@ def _default_builder_spec() -> StrategySpec:
     return StrategySpec(strategy="per_request")
 
 
+class TaskSpec(BaseModel):
+    """Validated container, harness, builder, and evaluator recipe."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    runtime: RuntimeSpec
+    agent: AgentSpec
+    builder: StrategySpec = Field(default_factory=_default_builder_spec)
+    evaluator: EvaluatorSpec
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
 class TaskRequest(BaseModel):
     """Task submitted by the trainer."""
 
@@ -67,6 +79,7 @@ class TaskRequest(BaseModel):
     agent: AgentSpec
     builder: StrategySpec = Field(default_factory=_default_builder_spec)
     evaluator: EvaluatorSpec | None = None
+    sampling_params: dict[str, object]
     callback_url: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
 
@@ -87,6 +100,7 @@ class SessionDispatchRequest(BaseModel):
     agent: AgentSpec
     builder: StrategySpec = Field(default_factory=_default_builder_spec)
     evaluator: EvaluatorSpec | None = None
+    sampling_params: dict[str, object]
     callback_url: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
 
@@ -134,6 +148,7 @@ class TaskResult(BaseModel):
     """Blocking response returned once all rollout sessions resolve."""
 
     task_id: str
+    instruction: str
     status: str  # Task-level status vocabulary: "running" | "completed" | "failed"
     results: list[SessionResult]
     result_paths: list[str] = Field(default_factory=list)
@@ -143,6 +158,7 @@ class TaskStatus(BaseModel):
     """Monitoring view for a task that may still be running."""
 
     task_id: str
+    instruction: str
     status: str
     total_sessions: int
     completed_sessions: int

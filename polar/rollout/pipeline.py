@@ -166,6 +166,7 @@ class Pipeline:
                 agent=session.request.agent,
                 builder=session.request.builder,
                 evaluator=session.request.evaluator,
+                sampling_params=dict(session.request.sampling_params),
                 metadata=dict(session.request.metadata),
             )
             try:

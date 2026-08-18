@@ -92,13 +92,19 @@ def _dataset(rows, prerender):
     return PromptDataset(rows, _Tok(), strategy, prerender=prerender)
 
 
-def test_dataset_row_is_five_tuple_and_collate_matches():
-    rows = [{**ROW, "tools": TOOLS, "images": ["a.png"]}]
+def test_dataset_row_includes_complete_polar_task_shape():
+    task = {
+        "runtime": {"image": "task:latest"},
+        "agent": {"harness": "codex"},
+        "evaluator": {"strategy": "session_completed"},
+    }
+    rows = [{**ROW, "tools": TOOLS, "images": ["a.png"], "task": task}]
     ds = _dataset(rows, prerender=False)
     item = ds[0]
-    assert len(item) == 5  # (datasource, prompt, label, images, tools) — dispatch chain contract
-    datasources, prompts, labels, images, tools = ds.collate_fn([item])
+    assert len(item) == 6
+    _datasources, prompts, _labels, images, tools, tasks = ds.collate_fn([item])
     assert prompts == [ROW["prompt"]] and images == [["a.png"]] and tools == [TOOLS]
+    assert tasks == [task]
 
 
 # ------------------------------ _wire_messages -------------------------------
@@ -137,7 +143,7 @@ def test_wire_without_images_or_markers_is_identity():
 
 def test_eval_metrics_maps_chat_list_prompts_to_datasource():
     # chat eval dataloader yields messages lists; samples carry the last user text
-    eval_dataloader = [(["geo3k"], [ROW["prompt"]], ["42"], [None], [None])]
+    eval_dataloader = [(["geo3k"], [ROW["prompt"]], ["42"], [None], [None], [None])]
     sample = SimpleNamespace(
         prompts=["<image>\nWhat is x?"],
         group_ids=["g1"],

@@ -1,0 +1,1 @@
+{"prompt":"Implement the TODOs in /polar/session/workspace/calculator.py. Build the recursive-descent parser methods for +, -, *, integer division, literals, and parentheses; make __call__ return the parsed value; do not add imports; then run python3 test_calculator.py. You must make an actual code change."}

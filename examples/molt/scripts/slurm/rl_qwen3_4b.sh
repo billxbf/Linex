@@ -25,9 +25,9 @@
 #SBATCH --overcommit
 #SBATCH --exclusive
 
-# Qwen3-4B dense math RL with FA2 + cu_seq_lens packing.
+# Qwen3-4B container-agent RL with FA2 + cu_seq_lens packing.
 # Thin wrapper over slurm/_launcher.sh that strips the VLM/MoE knobs
-# (EP=1, text-only single-turn math agent) and appends
+# (EP=1, text-only Polar calculator task) and appends
 # --fsdp.packing_samples to exercise the HF FA2 packed path
 # (cu_seq_lens_q/k kwargs from utils/fsdp/packing.py:182).
 #
@@ -45,7 +45,7 @@ export MODEL_PATH="${MODEL_PATH:-/path/to/models/Qwen3/Qwen3-4B-Instruct-2507}"
 export TP_SIZE="${TP_SIZE:-1}"
 export EP_SIZE="${EP_SIZE:-1}"
 export CP_SIZE="${CP_SIZE:-1}"
-export MAX_LENGTH="${MAX_LENGTH:-16384}"
+export MAX_LENGTH="${MAX_LENGTH:-65536}"
 # FA2 is required for HF packing (cu_seq_lens path); init-time validation
 # in Actor.from_pretrained refuses other attn impls when packing is on.
 export FSDP_ATTN_IMPLEMENTATION="${FSDP_ATTN_IMPLEMENTATION:-flash_attention_2}"
@@ -53,16 +53,20 @@ export FSDP_ATTN_IMPLEMENTATION="${FSDP_ATTN_IMPLEMENTATION:-flash_attention_2}"
 export VLLM_ENABLE_EXPERT_PARALLEL=0
 export FREEZE_VISUAL_ENCODER=0
 
-export AGENT_PATH="${AGENT_PATH:-/molt/examples/molt/python/agents/math.py}"
-export MAX_AGENT_TURNS="${MAX_AGENT_TURNS:-1}"
-
-export PROMPT_DATASET="${PROMPT_DATASET:-$REPO_ROOT/.tmp/proRL_text_rl/train}"
-export EVAL_DATASET="${EVAL_DATASET:-$REPO_ROOT/.tmp/proRL_text_rl/eval}"
-export MAX_SAMPLES="${MAX_SAMPLES:-4800}"
-export ENABLE_DYNAMIC_FILTERING="${ENABLE_DYNAMIC_FILTERING:-1}"
+export PROMPT_DATASET="${PROMPT_DATASET:-/molt/examples/polar/calculator/prompts.jsonl}"
+export TASK_SPEC="${TASK_SPEC-/molt/examples/polar/calculator/task.yaml}"
+export EVAL_DATASET="${EVAL_DATASET:-}"
+export MAX_SAMPLES="${MAX_SAMPLES:-1}"
+export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-1}"
+export ROLLOUT_GENERATE_BATCH_SIZE="${ROLLOUT_GENERATE_BATCH_SIZE:-1}"
+export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
+export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
+export ENABLE_DYNAMIC_FILTERING="${ENABLE_DYNAMIC_FILTERING:-0}"
 export EVAL_N_SAMPLES_PER_PROMPT="${EVAL_N_SAMPLES_PER_PROMPT:-1}"
 
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.8}"
+export VLLM_TOOL_CALL_PARSER="${VLLM_TOOL_CALL_PARSER:-qwen3_coder}"
+export VLLM_REASONING_PARSER="${VLLM_REASONING_PARSER:-qwen3}"
 
 export SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/rl-qwen3-4b-packing/run}"
 export WANDB_PROJECT="${WANDB_PROJECT:-molt_rl_qwen3_4b_packing}"
@@ -80,15 +84,13 @@ set -x
 
 REPO_ROOT="${MOLT_PATH:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}}"
 CONTAINER_IMAGE="${CONTAINER_IMAGE:-$REPO_ROOT/images/molt-cu13.sqsh}"
-MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to the VLM checkpoint to train.}"
+MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to a Qwen3-4B checkpoint.}"
 
-# PROMPT_DATASET / EVAL_DATASET are exported above (proRL_text_rl by default).
-# Override either env var to swap in your own text-only math data.
+# PROMPT_DATASET and TASK_SPEC are exported above. Dataset rows may instead
+# carry a complete `task` object for instance-specific runtimes/evaluators.
 test -n "${PROMPT_DATASET:-}"
 
 SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/molt-async-visual-rl/$SLURM_JOB_ID}"
-AGENT_PATH="${AGENT_PATH:-/molt/examples/molt/python/agents/math.py}"
-
 # Default the AutoModel source override to the sibling checkout if it exists, so
 # the latest main wins over the version baked into the container image.
 DEFAULT_AUTOMODEL_PATH=/path/to/Automodel
@@ -263,8 +265,6 @@ RL_ARGS=(
   --actor.model_name_or_path "$MODEL_PATH"
   --data.prompt_dataset "$PROMPT_DATASET"
   --data.input_key "${INPUT_KEY:-prompt}"
-  --data.label_key "${LABEL_KEY:-reward_model}"
-  --data.apply_chat_template
   --data.image_key "${IMAGE_KEY:-images}"
   --data.max_samples "$MAX_SAMPLES"
   --data.max_len "$MAX_LENGTH"
@@ -286,6 +286,8 @@ RL_ARGS=(
   --ref.num_gpus_per_node "$ACTOR_GPUS_PER_NODE"
   --vllm.num_engines "$VLLM_NUM_ENGINES"
   --vllm.tensor_parallel_size "$VLLM_TP_SIZE"
+  --vllm.tool_call_parser "$VLLM_TOOL_CALL_PARSER"
+  --vllm.reasoning_parser "$VLLM_REASONING_PARSER"
   --vllm.sync_backend nccl
   --vllm.gpu_memory_utilization "$VLLM_GPU_MEMORY_UTILIZATION"
   --vllm.mm_encoder_attn_backend "$VLLM_MM_ENCODER_ATTN_BACKEND"
@@ -318,7 +320,13 @@ RL_ARGS=(
   --logger.wandb.run_name "${WANDB_RUN_NAME:-visual_rl_$SLURM_JOB_ID}"
 )
 
-RL_ARGS+=(--train.agent_path "$AGENT_PATH")
+RL_ARGS+=(
+  --rollout.gateway_count "${POLAR_GATEWAY_COUNT:-2}"
+  --rollout.gateway_concurrency "${POLAR_GATEWAY_CONCURRENCY:-2}"
+  --rollout.session_timeout "${POLAR_SESSION_TIMEOUT:-1200}"
+  --rollout.save_dir "$SAVE_ROOT/rollouts"
+)
+[ -z "$TASK_SPEC" ] || RL_ARGS+=(--rollout.task_spec "$TASK_SPEC")
 
 # A rollout spanning a weight broadcast can mix policy versions. The HTTP path
 # cannot mark that boundary, so PARTIAL_ROLLOUT=1 requires per-token IS correction;

@@ -63,12 +63,16 @@ class GatewayState:
 
 _state: GatewayState | None = None
 _configured_topology_path: str | None = None
+_configured_topology: TopologyConfig | None = None
 _configured_node_id: str | None = None
 
 
-def configure_server(topology_path: str = "topology.yaml", *, node_id: str | None = None) -> None:
-    global _configured_topology_path, _configured_node_id, _state
-    _configured_topology_path = topology_path
+def configure_server(
+    topology: str | TopologyConfig = "topology.yaml", *, node_id: str | None = None
+) -> None:
+    global _configured_topology_path, _configured_topology, _configured_node_id, _state
+    _configured_topology = topology if isinstance(topology, TopologyConfig) else None
+    _configured_topology_path = topology if isinstance(topology, str) else None
     _configured_node_id = node_id
     _state = None
 
@@ -118,12 +122,15 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
 def get_state() -> GatewayState:
     global _state
     if _state is None:
-        topology_path = _configured_topology_path or os.environ.get(
-            "POLAR_TOPOLOGY",
-            "topology.yaml",
-        )
+        topology = _configured_topology
+        if topology is None:
+            topology_path = _configured_topology_path or os.environ.get(
+                "POLAR_TOPOLOGY",
+                "topology.yaml",
+            )
+            topology = TopologyConfig.load(topology_path)
         node_id = _configured_node_id or os.environ.get("POLAR_GATEWAY_NODE_ID")
-        _state = _build_state(TopologyConfig.load(topology_path), node_id)
+        _state = _build_state(topology, node_id)
     return _state
 
 
@@ -565,7 +572,11 @@ async def _handle_non_streaming(
 ) -> JSONResponse:
     state = get_state()
     try:
-        response = await state.inference.completion(openai_request)
+        response = await state.inference.completion(
+            openai_request,
+            session_id=session_id,
+            sampling_params=session_info.sampling_params if session_info else None,
+        )
     except UpstreamError as exc:
         logger.warning("Non-streaming upstream error for session %s: %s", session_id, exc)
         return _upstream_error_response(api_type, exc)
@@ -600,7 +611,11 @@ async def _handle_streaming(
     non_stream_request = {k: v for k, v in openai_request.items() if k != "stream_options"}
     non_stream_request["stream"] = False
     try:
-        response = await state.inference.completion(non_stream_request)
+        response = await state.inference.completion(
+            non_stream_request,
+            session_id=session_id,
+            sampling_params=session_info.sampling_params if session_info else None,
+        )
     except UpstreamError as exc:
         logger.warning("Upstream error for streaming session %s: %s", session_id, exc)
         return _upstream_error_response(api_type, exc)

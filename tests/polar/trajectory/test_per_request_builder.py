@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from polar.trajectory.builder.per_request import PerRequestBuilder
 from polar.trajectory.models import CompletionRecord, CompletionSession
 
@@ -9,7 +11,7 @@ from polar.trajectory.models import CompletionRecord, CompletionSession
 def test_per_request_builder_returns_error_for_empty_session() -> None:
     session = CompletionSession(
         session_id="session-1",
-        metadata={"group_id": "g1", "policy_version": 7},
+        metadata={"group_id": "g1"},
     )
 
     trajectory = asyncio.run(PerRequestBuilder().build(session))
@@ -18,7 +20,6 @@ def test_per_request_builder_returns_error_for_empty_session() -> None:
     assert trajectory.error == "no completions"
     assert trajectory.metadata["builder"] == "per_request"
     assert trajectory.metadata["group_id"] == "g1"
-    assert trajectory.metadata["policy_version"] == 7
     assert trajectory.traces == []
 
 
@@ -29,7 +30,6 @@ def test_per_request_builder_emits_one_trace_per_completion() -> None:
         model_requested="requested",
         model_used="served",
         api_type="openai_chat",
-        metadata={"rollout_step": 3},
         completions=[
             CompletionRecord(
                 completion_id="completion-1",
@@ -63,7 +63,6 @@ def test_per_request_builder_emits_one_trace_per_completion() -> None:
     assert trajectory.status == "COMPLETED"
     assert trajectory.metadata["record_count"] == 1
     assert trajectory.metadata["trace_count"] == 1
-    assert trajectory.metadata["rollout_step"] == 3
     trace = trajectory.traces[0]
     assert trace.prompt_ids == [1, 2]
     assert trace.response_ids == [3, 4]
@@ -74,7 +73,7 @@ def test_per_request_builder_emits_one_trace_per_completion() -> None:
     assert trace.response_logprobs == [-0.1, -0.2]
 
 
-def test_per_request_builder_does_not_mix_unaligned_token_sources() -> None:
+def test_per_request_builder_rejects_unaligned_token_sources() -> None:
     session = CompletionSession(
         session_id="session-1",
         completions=[
@@ -101,8 +100,5 @@ def test_per_request_builder_does_not_mix_unaligned_token_sources() -> None:
         ],
     )
 
-    trajectory = asyncio.run(PerRequestBuilder().build(session))
-    trace = trajectory.traces[0]
-
-    assert trace.response_ids == [3, 4, 5]
-    assert trace.response_logprobs is None
+    with pytest.raises(ValueError, match="trainable response tokens require aligned response_logprobs"):
+        asyncio.run(PerRequestBuilder().build(session))

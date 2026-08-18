@@ -23,6 +23,17 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 
+def first_scalar(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach") and hasattr(value, "flatten"):
+        value = value.detach().flatten()
+        return value[0].item() if value.numel() else None
+    if isinstance(value, (list, tuple)):
+        return first_scalar(value[0]) if value else None
+    return value
+
+
 def convert_to_torch_dtype(param_dtype: str) -> torch.dtype:
     """Map a param_dtype string ("bf16" / "fp16" / "fp32") to its torch.dtype."""
     mapping = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}

@@ -57,3 +57,11 @@ preferences. A violation is a bug and must be fixed before the change ships.
   upstream issue/PR links.
 - One problem = one minimal diff. Do not batch unrelated "improvements".
 - A "bug" that cannot trigger under the real recipes is not worth fixing.
+
+
+## Code Reference
+
+The original upstream of Molt (reference/labs-molt) and Polar (reference/ProRL-Agent-Server)
+are cloned locally for read-only reference. Do not modify or treat them as dependency in 
+any way. They are put here to demonstrate the original implementations 
+of respective frameworks and to keep track of their latest changes.

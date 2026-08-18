@@ -1,70 +1,42 @@
-# SWE-bench Verified Example
+# SWE-bench Verified training recipe
 
-Evaluate Polar agent harnesses on [SWE-bench Verified](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified)
-(500 human-validated tasks). Each task runs an agent inside a per-instance
-container at the repo's `base_commit`, then grades the patch with the official
-`swebench` harness.
+This recipe trains through the Molt CLI while Polar runs each coding agent in
+its per-instance SWE-bench container and applies the official evaluator. There
+is no separately launched Polar service or user-maintained topology.
 
-## Prerequisites
+## Prepare
 
-Install LiNex with vLLM as described in the
-[top-level README](../../../README.md#installation). This example also needs
-the official SWE-bench grading harness:
+Install the SWE-bench extra and build the runtime images on every possible
+gateway node:
 
 ```bash
-uv pip install -e ".[swebench]"
+uv pip install -e '.[swebench]'
+uv run python examples/polar/swebench_verified/build_images.py --max-tasks 10
 ```
 
-This example assumes 1 node **8×H100** — two inference servers (tensor-parallel 4 each).
-
-Adjust the setup and topology for your hardware.
-
-## Quick Start
-
-### 1. Build runtime images
-
-Each runtime image layers Node.js on the per-instance SWE-bench image; harness
-CLIs install at task time during the **INIT** stage. Build a subset first:
+Materialize complete, validated Polar task shapes in the training dataset:
 
 ```bash
-uv run python examples/polar/swebench_verified/build_images.py --max-tasks 10   # or no flag for all 500
+uv run python examples/polar/swebench_verified/submit_swebench_tasks.py \
+  --harness codex --max-tasks 10 \
+  --output examples/polar/swebench_verified/training.jsonl
 ```
 
-### 2. Start two inference servers
+Each row owns its instruction, runtime image, evaluator instance, and other
+instance-specific task data. Molt remains the sole owner of sampling, sample
+count, timeout, gateway concurrency, task identity, and training settings.
+
+## Train
+
+The small single-node configuration can be reused for a smoke run:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 uv run vllm serve Qwen/Qwen3.6-27B --port 8000 \
-  --tensor-parallel-size 4 --max-model-len 262144 \
-  --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
-
-CUDA_VISIBLE_DEVICES=4,5,6,7 uv run vllm serve Qwen/Qwen3.6-27B --port 8001 \
-  --tensor-parallel-size 4 --max-model-len 262144 \
-  --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
+MODEL_PATH=/path/to/Qwen3-4B \
+PROMPT_DATASET=$PWD/examples/polar/swebench_verified/training.jsonl \
+TASK_SPEC= MAX_SAMPLES=10 POLAR_SESSION_TIMEOUT=3600 \
+  bash examples/molt/scripts/quick_start/rl_qwen3_4b.sh
 ```
 
-### 3. Start Polar services
-
-```bash
-POLAR_TOPOLOGY=examples/polar/swebench_verified/topology.yaml uv run python -m polar.rollout.server
-POLAR_TOPOLOGY=examples/polar/swebench_verified/topology.yaml POLAR_GATEWAY_NODE_ID=localhost-node-01 uv run python -m polar.gateway.server
-POLAR_TOPOLOGY=examples/polar/swebench_verified/topology.yaml POLAR_GATEWAY_NODE_ID=localhost-node-02 uv run python -m polar.gateway.server
-```
-
-### 4. Submit tasks
-
-Pick a harness and how many tasks to run; the resolved-rate summary prints to
-the console when the batch finishes. Supported harnesses: `claude_code`, `codex`, `opencode`, `qwen_code`.
-
-
-```bash
-# pass@1 over the first 10 tasks
-uv run python examples/polar/swebench_verified/submit_swebench_tasks.py --harness claude_code --max-tasks 10
-
-# pass@8 over the first 10 tasks
-uv run python examples/polar/swebench_verified/submit_swebench_tasks.py --harness claude_code --max-tasks 10 --num-samples 8
-
-# a single instance
-uv run python examples/polar/swebench_verified/submit_swebench_tasks.py --harness codex --instance-id django__django-15098
-```
-
-Use Apptainer instead of Docker with `--runtime-backend apptainer`.
+For a production run, carry the same dataset arguments into the Slurm recipe
+and size actor/vLLM resources for the selected model. Task-specific harness and
+SWE-bench dependencies belong in the runtime images or `runtime.prepare`.

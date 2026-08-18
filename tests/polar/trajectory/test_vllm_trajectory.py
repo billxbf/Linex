@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from polar.trajectory.builder.per_request import PerRequestBuilder
 from polar.trajectory.builder.prefix_merging import PrefixMergingBuilder
 from polar.trajectory.models import CompletionRecord, CompletionSession
@@ -99,7 +101,7 @@ def test_prefix_merging_preserves_interstitial_tokens_and_logprobs() -> None:
     assert trace.response_logprobs == [-0.1, -0.2, -0.3, 0.0, 0.0, -0.5, -0.6, -0.7]
 
 
-def test_prefix_merging_drops_incomplete_trainable_logprobs() -> None:
+def test_prefix_merging_rejects_incomplete_trainable_logprobs() -> None:
     user = {"role": "user", "content": "Q1"}
     records = [
         _record(
@@ -124,13 +126,9 @@ def test_prefix_merging_drops_incomplete_trainable_logprobs() -> None:
         ),
     ]
 
-    trajectory = asyncio.run(
-        PrefixMergingBuilder(end_of_turn_token_id=_EOT).build(
-            CompletionSession(session_id="s", completions=records)
+    with pytest.raises(ValueError, match="trainable response tokens require aligned response_logprobs"):
+        asyncio.run(
+            PrefixMergingBuilder(end_of_turn_token_id=_EOT).build(
+                CompletionSession(session_id="s", completions=records)
+            )
         )
-    )
-    trace = trajectory.traces[0]
-
-    assert trace.response_ids == [10, 11, _EOT, 50, 51, 20, 21, _EOT]
-    assert trace.loss_mask == [1, 1, 1, 0, 0, 1, 1, 1]
-    assert trace.response_logprobs is None

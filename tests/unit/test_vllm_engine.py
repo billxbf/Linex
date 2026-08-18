@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import inspect
 import sys
 from dataclasses import dataclass
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 
 def _install_vllm_test_stub():
@@ -129,3 +130,46 @@ def test_rollout_ray_actor_init_is_synchronous():
     """Ray actor constructors are synchronous; an async __init__ would not be awaited."""
     actor_cls = getattr(vllm_engine.RolloutRayActor, "__ray_actor_class__", vllm_engine.RolloutRayActor)
     assert not inspect.iscoroutinefunction(actor_cls.__init__)
+
+
+def test_openai_server_enables_configured_output_parsers(monkeypatch):
+    args = SimpleNamespace(enable_auto_tool_choice=False, tool_call_parser=None, reasoning_parser=None)
+    app = SimpleNamespace(state=SimpleNamespace())
+    api_server = SimpleNamespace(
+        build_app=lambda *_: app,
+        init_app_state=lambda *_: asyncio.sleep(0),
+    )
+    parser = SimpleNamespace(parse_args=lambda _: args)
+
+    uvicorn = ModuleType("uvicorn")
+    uvicorn.Config = lambda *_, **__: None
+    uvicorn.Server = lambda _: SimpleNamespace(
+        started=True,
+        servers=[SimpleNamespace(sockets=[SimpleNamespace(getsockname=lambda: ("127.0.0.1", 8000))])],
+        serve=lambda: asyncio.sleep(0),
+    )
+    cli_args = ModuleType("vllm.entrypoints.openai.cli_args")
+    cli_args.make_arg_parser = lambda _: parser
+    argparse_utils = ModuleType("vllm.utils.argparse_utils")
+    argparse_utils.FlexibleArgumentParser = object
+    openai = ModuleType("vllm.entrypoints.openai")
+    openai.api_server = api_server
+    monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints", ModuleType("vllm.entrypoints"))
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints.openai", openai)
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints.openai.cli_args", cli_args)
+    monkeypatch.setitem(sys.modules, "vllm.utils.argparse_utils", argparse_utils)
+
+    actor_cls = getattr(vllm_engine.RolloutRayActor, "__ray_actor_class__", vllm_engine.RolloutRayActor)
+    actor = actor_cls.__new__(actor_cls)
+    actor.kwargs = {"model": "model-path"}
+    actor.llm = SimpleNamespace(
+        get_supported_tasks=lambda: asyncio.sleep(0, result=("generate",)),
+        model_config=object(),
+    )
+
+    asyncio.run(actor.serve_openai(tool_call_parser="qwen3_coder", reasoning_parser="qwen3"))
+
+    assert args.enable_auto_tool_choice is True
+    assert args.tool_call_parser == "qwen3_coder"
+    assert args.reasoning_parser == "qwen3"

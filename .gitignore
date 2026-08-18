@@ -166,6 +166,8 @@ checkpoints
 
 # local dev files
 rfcs/
+reference/
+uv.lock
 
 # local benchmark workspace (untracked; slated to move into .tmp)
 /bench/

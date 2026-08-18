@@ -49,6 +49,10 @@ class UpstreamTransportError(UpstreamError):
     """Raised for connection and transport failures."""
 
 
+class InferenceContractError(UpstreamError):
+    """Raised when an inference response violates the training contract."""
+
+
 class InferenceClient:
     """Direct httpx client to an inference server's OpenAI-compatible API.
 
@@ -103,50 +107,81 @@ class InferenceClient:
             return UpstreamTimeoutError("Upstream request timed out")
         return UpstreamTransportError(f"Upstream request failed: {exc}")
 
-    async def completion(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Non-streaming chat completion. Returns the full JSON response."""
-        await self._acquire_generation_slot()
-        client = await self._get_client()
+    async def completion(
+        self,
+        request: dict[str, Any],
+        *,
+        session_id: str,
+        sampling_params: dict[str, object] | None,
+    ) -> dict[str, Any]:
+        """Run one non-streaming chat completion with Molt's sampling policy."""
+        if not sampling_params:
+            raise InferenceContractError("Molt sampling parameters are required")
+
         request_copy = deepcopy(request)
-        request_copy.pop("stream", None)
+        request_copy.update(
+            {
+                name: value
+                for name, value in sampling_params.items()
+                if name not in {"max_total_tokens", "skip_special_tokens", "include_stop_str_in_output"}
+            }
+        )
+        # vLLM gives this OpenAI alias precedence over max_tokens.
+        request_copy.pop("max_completion_tokens", None)
         request_copy["stream"] = False
         request_copy["logprobs"] = True
         request_copy["return_token_ids"] = True
-        request_copy.setdefault("top_logprobs", 0)
+        request_copy["top_logprobs"] = 0
         for message in request_copy.get("messages") or []:
             if isinstance(message, dict) and message.get("reasoning_content") is not None:
                 message["reasoning"] = message.pop("reasoning_content")
+
+        await self._acquire_generation_slot()
         try:
-            resp = await client.post(
+            client = await self._get_client()
+            response = await client.post(
                 "/v1/chat/completions",
                 json=request_copy,
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", "x-session-id": session_id},
             )
+            await self._raise_for_status(response)
         except httpx.RequestError as exc:
             raise self._translate_transport_error(exc) from exc
         finally:
             await self._release_generation_slot()
 
-        await self._raise_for_status(resp)
-        response = resp.json()
-        for choice in response.get("choices") or []:
-            if not isinstance(choice, dict):
-                continue
-            message = choice.get("message")
-            if (
-                isinstance(message, dict)
-                and message.get("reasoning_content") is None
-                and message.get("reasoning") is not None
-            ):
-                message["reasoning_content"] = message.pop("reasoning")
-            token_ids = choice.get("token_ids")
-            logprobs = choice.get("logprobs")
-            content = logprobs.get("content") if isinstance(logprobs, dict) else None
-            if isinstance(token_ids, list) and isinstance(content, list) and len(token_ids) == len(content):
-                for entry, token_id in zip(content, token_ids):
-                    if isinstance(entry, dict):
-                        entry.setdefault("token_id", token_id)
-        return response
+        result = response.json()
+        prompt_ids = result.get("prompt_token_ids")
+        if not isinstance(prompt_ids, list):
+            raise InferenceContractError("chat completion returned no prompt_token_ids")
+
+        choices = result.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise InferenceContractError("chat completion returned no choices[0]")
+        choice = choices[0]
+        token_ids = choice.get("token_ids")
+        if not isinstance(token_ids, list):
+            raise InferenceContractError("chat completion returned no choices[0].token_ids")
+        logprobs = choice.get("logprobs")
+        content = logprobs.get("content") if isinstance(logprobs, dict) else None
+        if not isinstance(content, list):
+            raise InferenceContractError("chat completion returned no choices[0].logprobs.content")
+        if len(content) != len(token_ids):
+            raise InferenceContractError(
+                f"chat completion returned {len(token_ids)} token IDs and {len(content)} log probabilities"
+            )
+        if any(not isinstance(entry, dict) or entry.get("logprob") is None for entry in content):
+            raise InferenceContractError("chat completion returned a token without a log probability")
+        for entry, token_id in zip(content, token_ids, strict=True):
+            entry["token_id"] = token_id
+        message = choice.get("message")
+        if (
+            isinstance(message, dict)
+            and message.get("reasoning_content") is None
+            and message.get("reasoning") is not None
+        ):
+            message["reasoning_content"] = message.pop("reasoning")
+        return result
 
     async def _acquire_generation_slot(self) -> None:
         async with self._generation_condition:

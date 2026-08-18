@@ -98,11 +98,12 @@ class PromptDataset(Dataset):
         # Eager preprocessing held the entire rendered corpus in RAM (self.prompts/labels/images),
         # which OOMs and stalls __init__ on large datasets (e.g. multi-million-row, ~100KB/prompt
         # multimodal corpora). Lazy keeps init O(1) memory + near-instant; the dataloader workers
-        # render only the rows actually sampled. __getitem__'s return value is unchanged.
+        # render only the rows actually sampled.
         self.dataset = dataset
         self.input_key = getattr(self.strategy.args.data, "input_key", None)
         self.label_key = getattr(self.strategy.args.data, "label_key", None)
         self.tools_key = getattr(self.strategy.args.data, "tools_key", None)
+        self.task_key = getattr(self.strategy.args.data, "task_key", "task")
         self.image_key = getattr(self.strategy.args.data, "image_key", "images")
         apply_chat_template = getattr(self.strategy.args.data, "apply_chat_template", False)
         self.apply_chat_template = self.tokenizer.apply_chat_template if apply_chat_template else None
@@ -125,7 +126,14 @@ class PromptDataset(Dataset):
             expand_image_placeholder=self.expand_image_placeholder,
             tools=tools,
         )
-        return data.get("datasource", "default"), prompt, label, data.get(self.image_key, None), tools
+        return (
+            data.get("datasource", "default"),
+            prompt,
+            label,
+            data.get(self.image_key, None),
+            tools,
+            data.get(self.task_key),
+        )
 
     def collate_fn(self, item_list):
         datasources = []
@@ -133,11 +141,13 @@ class PromptDataset(Dataset):
         labels = []
         images = []
         tools = []
-        for datasource, prompt, label, img, tool in item_list:
+        tasks = []
+        for datasource, prompt, label, img, tool, task in item_list:
             datasources.append(datasource)
             prompts.append(prompt)
             labels.append(label)
             images.append(img)
             tools.append(tool)
+            tasks.append(task)
 
-        return datasources, prompts, labels, images, tools
+        return datasources, prompts, labels, images, tools, tasks

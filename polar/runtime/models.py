@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 
 class ExecInput(BaseModel):
@@ -27,6 +28,14 @@ class PrepareAction(BaseModel):
     command: str | None = None
     cwd: str | None = None
     env: dict[str, str] | None = None
+
+    @field_validator("source")
+    @classmethod
+    def _resolve_source(cls, value: str | None, info: ValidationInfo) -> str | None:
+        base_dir = info.context.get("base_dir") if info.context else None
+        if value and base_dir and not Path(value).is_absolute():
+            return str((Path(base_dir) / value).resolve())
+        return value
 
     @model_validator(mode="after")
     def _validate_fields(self) -> PrepareAction:

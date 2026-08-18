@@ -229,13 +229,20 @@ RUN { find ${SITE}/nvidia -mindepth 2 -maxdepth 2 -type d -name lib | sort; echo
 RUN apt-get update && apt-get install -y --no-install-recommends cuda-compat-13-0 && \
     rm -rf /var/lib/apt/lists/*
 
+# Install the Linex sources without resolving dependencies again. Task runtime
+# images remain separate; this image hosts Molt, Polar, and the vLLM router.
+COPY molt /opt/linex/molt
+COPY polar /opt/linex/polar
+COPY setup.py pyproject.toml version.txt README.md requirements.txt /opt/linex/
+RUN python -m pip install --no-deps /opt/linex
+
 # --- build-time import self-check -----------------------------------------------
 # Fail the build if the installed stack can't import, so a dependency bump can't ship an image
 # that only crashes at a user's runtime — e.g. the quack-vs-cutlass-DSL drift that broke
 # `import mamba_ssm`. Every module below imports in the CPU-only builder; deep_ep is the lone
 # exception (needs libcuda at import) and is covered by the NVSHMEM restore step above.
 RUN python -c "import importlib; \
-[importlib.import_module(m) for m in ('torch','transformers','ray','nemo_automodel','quack','quack.layout_utils','fla','tilelang','tvm_ffi','vllm_router','transformer_engine.pytorch','flash_attn','causal_conv1d','mamba_ssm','flashinfer','vllm')]; \
+[importlib.import_module(m) for m in ('molt','polar','polar.rollout.server','polar.gateway.server','torch','transformers','ray','nemo_automodel','quack','quack.layout_utils','fla','tilelang','tvm_ffi','vllm_router','transformer_engine.pytorch','flash_attn','causal_conv1d','mamba_ssm','flashinfer','vllm')]; \
 print('BUILD IMPORT CHECK OK')"
 
 # --- Entrypoint -----------------------------------------------------------------

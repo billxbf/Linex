@@ -113,13 +113,15 @@ class Trace(BaseModel):
 
     @model_validator(mode="after")
     def _validate_response_lengths(self) -> "Trace":
-        if self.loss_mask and len(self.loss_mask) != len(self.response_ids):
+        if len(self.loss_mask) != len(self.response_ids):
             raise ValueError("loss_mask length must match response_ids length")
         if (
             self.response_logprobs is not None
             and len(self.response_logprobs) != len(self.response_ids)
         ):
             raise ValueError("response_logprobs length must match response_ids length")
+        if any(self.loss_mask) and self.response_logprobs is None:
+            raise ValueError("trainable response tokens require aligned response_logprobs")
         return self
 
 

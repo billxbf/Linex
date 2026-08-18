@@ -20,8 +20,8 @@ so a rollout's render+generate co-locate on one engine); weight sync bypasses it
 one client, ``RouterGenerateClient.generate(token_ids, sp, mm) -> (RequestOutput, off_policy_len)``:
 token-in / token-out over vLLM's ``/inference/v1/generate`` (VLM images are rendered server-side
 first, over ``/v1/chat/completions/render``, for their mm features). Both the StepEnvRunner and the
-chat server (``_chat_server``) share it. These custom routes survive the router verbatim, unlike the
-OpenAI ``/v1/*`` routes whose token_ids the router schema-strips.
+chat server (``_chat_server``) share it. Polar's gateway uses the router's OpenAI
+``/v1/chat/completions`` route directly.
 
 ``AgentRunnerActor`` is the rollout driver process running those runners against the router; the
 trainer round-robins prompts across a list of them (``--rollout.num_runners``).
@@ -107,6 +107,19 @@ class VllmRouterActor:
                     return self.url()
             time.sleep(2.0)
         raise RuntimeError(f"vLLM router did not come up on {self._host}:{self._port}")
+
+    def close(self):
+        """Stop and reap the router subprocess."""
+        import subprocess
+
+        if self._proc.poll() is not None:
+            return
+        self._proc.terminate()
+        try:
+            self._proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait()
 
 
 def _decode_routed_experts(blob):
@@ -202,9 +215,7 @@ class RouterGenerateClient:
     prompt+gen array). VLM: it first ``/v1/chat/completions/render``s the image(s) SERVER-SIDE to get
     vLLM's mm ``features`` (pixel tensors), realigns those placeholders onto our canonical HF prompt
     ids, and sends them with the generate — the image is embedded by STOCK server-side mm processing
-    (no vLLM source patch). Both routes are custom, so the vllm-router forwards them VERBATIM (unlike
-    the OpenAI ``/v1/*`` routes, whose token_ids the router schema-strips). It also carries the shared
-    aiohttp session (``.http``)."""
+    (no vLLM source patch). It also carries the shared aiohttp session (``.http``)."""
 
     def __init__(self, http_client, *, model_name="policy", image_token_id=None):
         self.http = http_client
@@ -289,9 +300,8 @@ class RouterGenerateClient:
             logprobs=logprobs,
             routed_experts=_decode_routed_experts(re_blob) if (re_blob is not None and ids) else None,
         )
-        # off_policy_len=0: the HTTP transport can't observe a mid-request weight-swap boundary and
-        # doesn't need to — each token keeps its generation-time logprob, so per-token IS
-        # (models/loss.py) corrects a mixed-weights request and the tis band drops the diverged tokens.
+        # The HTTP path has no per-token policy-boundary mask. Generation-time
+        # logprobs let IS correct stale traces after a later weight broadcast.
         return SimpleNamespace(outputs=[gen], prompt_routed_experts=None), 0
 
 
@@ -384,12 +394,31 @@ class AgentRunnerActor:
         return results
 
 
-def create_vllm_router(engines, *, policy="consistent_hash", port=None):
+def create_vllm_router(
+    engines,
+    *,
+    policy="consistent_hash",
+    port=None,
+    tool_call_parser=None,
+    reasoning_parser=None,
+):
     """Serve each engine's OpenAI API + launch the vllm-router in front; return (router, url).
 
     Default policy ``consistent_hash`` routes by the ``x-session-id`` header so a rollout's render +
     generate land on ONE engine (mm-feature cache affinity — see ``RouterGenerateClient.generate``);
     prefix caching is off, so ``cache_aware`` would add no KV reuse to trade for that affinity."""
-    engine_urls = ray.get([e.serve_openai.remote() for e in engines])
+    engine_urls = ray.get(
+        [
+            engine.serve_openai.remote(
+                tool_call_parser=tool_call_parser,
+                reasoning_parser=reasoning_parser,
+            )
+            for engine in engines
+        ]
+    )
     router = VllmRouterActor.remote(engine_urls, policy=policy, port=port)
-    return router, ray.get(router.ready.remote())
+    try:
+        return router, ray.get(router.ready.remote())
+    except Exception:
+        ray.get(router.close.remote())
+        raise

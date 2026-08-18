@@ -26,6 +26,6 @@ tqdm
 transformers
 uvicorn>=0.30.0
 vllm==0.27.1
-vllm-router>=0.1.14
+vllm-router>=0.1.15
 wandb
 wheel

@@ -29,6 +29,7 @@ _CALLBACK_TIMEOUT_SECONDS = 10.0
 @dataclass(slots=True)
 class _TaskRecord:
     task_id: str
+    instruction: str
     status: str
     total_sessions: int
     completed_sessions: int = 0
@@ -58,6 +59,7 @@ class RolloutManager:
                 raise ValueError(f"task {request.task_id} is already running")
             self._tasks[request.task_id] = _TaskRecord(
                 task_id=request.task_id,
+                instruction=request.instruction,
                 status="running",
                 total_sessions=request.num_samples,
             )
@@ -129,6 +131,7 @@ class RolloutManager:
 
         return TaskResult(
             task_id=request.task_id,
+            instruction=request.instruction,
             status="completed",
             results=ordered_results,
             result_paths=result_paths,
@@ -141,6 +144,7 @@ class RolloutManager:
                 return None
             return TaskStatus(
                 task_id=record.task_id,
+                instruction=record.instruction,
                 status=record.status,
                 total_sessions=record.total_sessions,
                 completed_sessions=record.completed_sessions,

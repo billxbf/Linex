@@ -144,6 +144,8 @@ def test_invalid_inference_base_url_is_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="inference.base_url"):
         TopologyConfig.load(path)
+
+
 def test_duplicate_gateway_node_ids_are_rejected(tmp_path: Path) -> None:
     path = _write_yaml(
         tmp_path / "topology.yaml",
@@ -159,3 +161,35 @@ def test_duplicate_gateway_node_ids_are_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Duplicate gateway node id"):
         TopologyConfig.load(path)
+
+
+def test_servers_accept_generated_topology_without_phantom_nodes(monkeypatch) -> None:
+    from polar.gateway import server as gateway_server
+    from polar.rollout import server as rollout_server
+
+    topology = TopologyConfig.model_validate(
+        {
+            "rollout": {"public_url": "http://rollout:8080"},
+            "gateway": {
+                "rollout_server_url": "http://rollout:8080",
+                "nodes": [
+                    {
+                        "id": "node-a",
+                        "public_url": "http://gateway:8081",
+                        "inference": {"base_url": "http://router:8000"},
+                    }
+                ],
+            },
+        }
+    )
+
+    rollout_state = rollout_server._build_state(topology)
+    assert rollout_state.scheduler.list_nodes() == []
+
+    monkeypatch.setattr(gateway_server, "_state", None)
+    monkeypatch.setattr(gateway_server, "_configured_topology", None)
+    monkeypatch.setattr(gateway_server, "_configured_topology_path", None)
+    monkeypatch.setattr(gateway_server, "_configured_node_id", None)
+    monkeypatch.setattr(gateway_server, "_build_state", lambda value, node_id: (value, node_id))
+    gateway_server.configure_server(topology, node_id="node-a")
+    assert gateway_server.get_state() == (topology, "node-a")

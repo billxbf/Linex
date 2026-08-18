@@ -55,6 +55,7 @@ class SessionInfo:
     registered: bool = False
     status: str = SessionStatus.REGISTERED
     result: SessionResult | None = None
+    sampling_params: dict[str, object] | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -72,6 +73,7 @@ class SessionRegistry:
         task_id: str | None = None,
         registered: bool = False,
         status: str = SessionStatus.REGISTERED,
+        sampling_params: dict[str, object] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> SessionInfo:
         session_id = clean_session_id(session_id) or generate_session_id()
@@ -84,6 +86,8 @@ class SessionRegistry:
                     info.task_id = task_id
                 info.registered = info.registered or registered
                 info.status = status or info.status
+                if sampling_params is not None:
+                    info.sampling_params = dict(sampling_params)
                 if metadata:
                     info.metadata = {**(info.metadata or {}), **metadata}
                 if status in SessionStatus.active():
@@ -97,6 +101,7 @@ class SessionRegistry:
                 task_id=task_id,
                 registered=registered,
                 status=status,
+                sampling_params=dict(sampling_params) if sampling_params is not None else None,
                 metadata=dict(metadata or {}),
             )
             self._sessions[session_id] = info

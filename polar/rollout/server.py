@@ -42,17 +42,19 @@ class RolloutState:
 
 _state: RolloutState | None = None
 _configured_topology_path: str | None = None
+_configured_topology: TopologyConfig | None = None
 
 
-def configure_server(topology_path: str = "topology.yaml") -> None:
-    global _configured_topology_path, _state
-    _configured_topology_path = topology_path
+def configure_server(topology: str | TopologyConfig = "topology.yaml") -> None:
+    global _configured_topology, _configured_topology_path, _state
+    _configured_topology = topology if isinstance(topology, TopologyConfig) else None
+    _configured_topology_path = topology if isinstance(topology, str) else None
     _state = None
 
 
 def _build_state(topology: TopologyConfig) -> RolloutState:
     rollout = topology.rollout
-    scheduler = NodeScheduler(bootstrap_nodes=topology.bootstrap_nodes)
+    scheduler = NodeScheduler()
     pipeline = Pipeline(
         callback_url=f"{rollout.public_url}/callbacks/session_result",
         save_dir=rollout.save_dir,
@@ -73,11 +75,10 @@ def _build_state(topology: TopologyConfig) -> RolloutState:
 def get_state() -> RolloutState:
     global _state
     if _state is None:
-        topology_path = _configured_topology_path or os.environ.get(
-            "POLAR_TOPOLOGY",
-            "topology.yaml",
+        topology = _configured_topology or TopologyConfig.load(
+            _configured_topology_path or os.environ.get("POLAR_TOPOLOGY", "topology.yaml")
         )
-        _state = _build_state(TopologyConfig.load(topology_path))
+        _state = _build_state(topology)
     return _state
 
 

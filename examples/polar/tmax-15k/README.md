@@ -1,99 +1,59 @@
-# TMax-15K-Harbor Example
+# TMax-15K-Harbor training recipe
 
-Run Polar agent harnesses on [TMax-15K-Harbor](https://hub.harborframework.com/datasets/tmax/TMax-15K-Harbor/latest)
-— 15k compositional terminal-agent tasks from [TMax](https://github.com/hamishivi/tmax),
-each a self-contained container with a programmatic verifier. Each task runs an
-agent inside its container, then the **`harbor`** evaluator scores it exactly
-as TMax does: inject the task's `tests/`, run `bash /tests/test.sh` (which runs
-`pytest test_final_state.py` and writes `0`/`1` to `/logs/verifier/reward.txt`),
-and read that reward back.
+TMax supplies containerized terminal-agent tasks with programmatic Harbor
+verifiers. Molt launches the full training stack; Polar runs each harness and
+returns token-faithful traces and verifier rewards to Molt.
 
-## Prerequisites
+## Prepare
 
-Polar + an inference backend (vLLM shown), Docker, and the **Harbor CLI** (used
-once to pull the dataset — it is a TMax dependency, not a Polar one):
+Pull the task directories and build the selected runtime images:
 
 ```bash
-uv pip install harbor          # for `harbor download` (or use the tmax checkout's env)
-```
-
-This example assumes 1 node **8×H100** — two inference servers (tensor-parallel 4 each).
-
-## Quick Start
-
-### 1. Pull the dataset (task dirs, not images)
-
-Harbor hub serves task directories; this fetches them to a local folder:
-
-```bash
+uv pip install harbor
 harbor download 'tmax/TMax-15K-Harbor@latest' --export --output-dir ~/tmax15k
+uv run python examples/polar/tmax-15k/build_images.py \
+  --dataset-dir ~/tmax15k --max-tasks 10
 ```
 
-Each task dir has `instruction.md`, `task.toml`, `environment/Dockerfile`, and
-`tests/` (the verifier, kept out of the image so the agent can't read it).
-
-### 2. Build runtime images
-
-Per task we build the sandbox from its `environment/Dockerfile`, then layer
-Node.js (`runtime/Dockerfile`) so the harness CLI can run inside it:
+Materialize the instruction and complete Polar task shape for every row:
 
 ```bash
-uv run python examples/polar/tmax-15k/build_images.py --dataset-dir ~/tmax15k --max-tasks 10
+uv run python examples/polar/tmax-15k/submit_tmax_tasks.py \
+  --dataset-dir ~/tmax15k --harness codex --max-tasks 10 \
+  --output examples/polar/tmax-15k/training.jsonl
 ```
 
-### 3. Start two inference servers (Qwen3.6-27B)
+The exported task directory must be visible at the same path on gateway nodes
+because the evaluator uploads each task's `tests/`. Runtime images and pinned
+harness dependencies must likewise be available on those nodes.
+
+## Train
+
+For a small single-node smoke run:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 uv run vllm serve Qwen/Qwen3.6-27B --port 8000 \
-  --tensor-parallel-size 4 --max-model-len 262144 \
-  --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
-
-CUDA_VISIBLE_DEVICES=4,5,6,7 uv run vllm serve Qwen/Qwen3.6-27B --port 8001 \
-  --tensor-parallel-size 4 --max-model-len 262144 \
-  --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
+MODEL_PATH=/path/to/Qwen3-4B \
+PROMPT_DATASET=$PWD/examples/polar/tmax-15k/training.jsonl \
+TASK_SPEC= MAX_SAMPLES=10 POLAR_SESSION_TIMEOUT=3600 \
+  bash examples/molt/scripts/quick_start/rl_qwen3_4b.sh
 ```
 
-### 4. Start Polar services
+Molt derives and saves the topology; do not launch Polar or vLLM separately.
+Sample count and timeout are Molt CLI settings, not dataset fields.
+
+## Apptainer
+
+On a Docker-capable machine, convert built images to `.sif`, copy them and the
+dataset directory to the cluster, then materialize rows that point at the
+shared `.sif` directory:
 
 ```bash
-POLAR_TOPOLOGY=examples/polar/tmax-15k/topology.yaml uv run python -m polar.rollout.server
-POLAR_TOPOLOGY=examples/polar/tmax-15k/topology.yaml POLAR_GATEWAY_NODE_ID=localhost-node-01 uv run python -m polar.gateway.server
-POLAR_TOPOLOGY=examples/polar/tmax-15k/topology.yaml POLAR_GATEWAY_NODE_ID=localhost-node-02 uv run python -m polar.gateway.server
-```
-
-### 5. Submit tasks
-
-The gateway rewrites the harness's `--model-name` to the served `Qwen/Qwen3.6-27B`.
-Supported harnesses: `codex`, `claude_code`, `opencode`, `qwen_code`, `pi`, `hermes`, `mini_swe_agent`.
-
-```bash
-# pass@4 over the first 10 tasks
-uv run python examples/polar/tmax-15k/submit_tmax_tasks.py --dataset-dir ~/tmax15k --harness hermes --max-tasks 10 --num-samples 4
-```
-
-Use Apptainer instead of Docker with `--runtime-backend apptainer` (this still
-reads images from a local docker daemon). For nodes **without Docker**, see
-[Docker-free runs](#docker-free-runs-apptainer-on-slurm) below.
-
-## Docker-free runs (Apptainer on Slurm)
-
-Slurm nodes without Docker can't `docker build` or pull `docker-daemon:` images.
-Build once on a docker-capable box, snapshot each runtime image to a `.sif`, copy
-them over, and launch the `.sif` directly — Polar's `ApptainerRuntime` needs only
-`apptainer` (set `POLAR_APPTAINER_BIN` if your cluster calls it `singularity`):
-
-```bash
-# on a box WITH docker — build images, then snapshot them to .sif
-uv run python examples/polar/tmax-15k/build_images.py --dataset-dir ~/tmax15k --max-tasks 10
 uv run python examples/polar/tmax-15k/prepare_apptainer_images.py \
   --dataset-dir ~/tmax15k --image-dir ~/tmax15k-sif --max-tasks 10
-
-# copy ~/tmax15k-sif/ to the cluster, then on Slurm (no docker needed):
-uv run python examples/polar/tmax-15k/submit_tmax_tasks.py --dataset-dir ~/tmax15k \
-  --harness hermes --max-tasks 10 \
+uv run python examples/polar/tmax-15k/submit_tmax_tasks.py \
+  --dataset-dir ~/tmax15k --harness codex --max-tasks 10 \
   --runtime-backend apptainer --apptainer-image-dir ~/tmax15k-sif
 ```
 
-The dataset dir must also be on the cluster: `submit` reads each task's
-`instruction.md`, and the `harbor` evaluator uploads its `tests/` into the
-container — only the *images* become `.sif`.
+The launch environment must already provide Docker or Apptainer; Linex does
+not provision container runtimes.

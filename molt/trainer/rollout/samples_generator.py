@@ -20,16 +20,17 @@ import copy
 import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
+from uuid import uuid4
 
 import numpy as np
 import ray
 import torch
 from tqdm import tqdm
-from vllm import SamplingParams
 
-from molt.agents.base import _first_scalar as _to_scalar  # dedupe: same tensor/list/scalar normalizer
 from molt.trainer.algorithm.experience import Experience
 from molt.utils.logging_utils import init_logger
+from molt.utils.utils import first_scalar
+from polar.rollout.models import SessionStatus, TaskRequest, TaskSpec, TaskStatus
 
 logger = init_logger(__name__)
 
@@ -63,22 +64,25 @@ def _collect_prompt_batch(dataloader_iter, num_prompts: int):
     collecting the returned prompts. Callers should still process any partial
     batch that was collected before exhaustion.
     """
-    prompts, labels, images, tools = [], [], [], []
+    prompts, labels, images, tools, task_specs = [], [], [], [], []
     exhausted = False
 
     while len(prompts) < num_prompts:
         try:
-            _, batch_prompts, batch_labels, batch_images, batch_tools = next(dataloader_iter)
+            batch = next(dataloader_iter)
+            _, batch_prompts, batch_labels, batch_images, batch_tools = batch[:5]
+            batch_task_specs = batch[5] if len(batch) > 5 else [None] * len(batch_prompts)
             remaining = num_prompts - len(prompts)
             prompts.extend(batch_prompts[:remaining])
             labels.extend(batch_labels[:remaining])
             images.extend(batch_images[:remaining])
             tools.extend(batch_tools[:remaining])
+            task_specs.extend(batch_task_specs[:remaining])
         except StopIteration:
             exhausted = True
             break
 
-    return prompts, labels, images, tools, exhausted
+    return prompts, labels, images, tools, task_specs, exhausted
 
 
 def _sample_group_key(sample) -> int | str:
@@ -96,7 +100,9 @@ class SamplesGenerator:
         prompts_dataloader,
         eval_dataloader,
         tokenizer,
-        agent_runners,
+        agent_runners=None,
+        polar_rollout=None,
+        task_spec=None,
     ):
         self.strategy = strategy
         self.args = strategy.args
@@ -105,6 +111,8 @@ class SamplesGenerator:
         # Runner actors driving rollouts through the vllm-router; prompts are round-robined
         # across them (self._rr) — no pool wrapper, just a list + an index.
         self.agent_runners = agent_runners
+        self.polar_rollout = polar_rollout
+        self.task_spec = TaskSpec.model_validate(task_spec) if task_spec is not None else None
         self._rr = 0
 
         self.prompts_dataloader = prompts_dataloader
@@ -224,16 +232,26 @@ class SamplesGenerator:
         )
 
         while finished_group_count() < groups_per_batch:
-            # Refill so the runner pool keeps `inflight_capacity` rollouts in flight (engines stay saturated).
+            # Refill up to `inflight_capacity` so rollout generation stays saturated.
             free_slots = inflight_capacity - len(self._inflight_rollouts)
+            if getattr(getattr(self.args, "train", None), "force_sync_mode", False):
+                needed = groups_per_batch - finished_group_count() - len(self._inflight_rollouts)
+                free_slots = min(free_slots, needed)
             if free_slots > 0 and self._dataloader_iter is not None:
-                prompts, labels, images, tools, dataloader_exhausted = _collect_prompt_batch(
+                prompts, labels, images, tools, task_specs, dataloader_exhausted = _collect_prompt_batch(
                     self._dataloader_iter, free_slots
                 )
                 prompts_dispatched += len(prompts)
                 if prompts:
                     self._inflight_rollouts.extend(
-                        self._dispatch_to_agent_runners(prompts, labels, images=images, tools=tools, **generate_kwargs)
+                        self._dispatch_rollouts(
+                            prompts,
+                            labels,
+                            images=images,
+                            tools=tools,
+                            task_specs=task_specs,
+                            **generate_kwargs,
+                        )
                     )
                 if dataloader_exhausted:
                     self._dataloader_iter = None
@@ -326,15 +344,29 @@ class SamplesGenerator:
         batch/eval (``_generate_batch``) paths call it, so the per-group filter loop
         is never reimplemented.
         """
-        # run_group already built each usable trajectory into a light Experience (heavy tensors
-        # kept on the runner behind heavy_ref) or reported a drop reason — the controller only
-        # tallies drops and applies the group-level DAPO filter here (both meta-only).
+        # Normalize the producer result into Experience/drop pairs, then apply
+        # the same group-level filtering to Polar and legacy rollouts.
         group_samples: List[Experience] = []
-        for experience, drop_reason in ray.get(finished_rollout):
+        result = ray.get(finished_rollout)
+        if getattr(self, "polar_rollout", None) is not None:
+            result = self._process_polar_task_result(
+                result,
+                generate_kwargs.get("max_len", self.args.data.max_len),
+            )
+        for experience, drop_reason in result:
             if experience is not None:
-                group_samples.append(experience)
+                group_samples.append(
+                    experience.offload() if getattr(self, "polar_rollout", None) is not None else experience
+                )
             elif drop_reason is not None:
                 drop_counts[drop_reason] += 1
+
+        if getattr(self, "polar_rollout", None) is not None and group_samples:
+            expected = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
+            rollout_count = len({sample.rollout_ids[0] for sample in group_samples})
+            if rollout_count < expected:
+                drop_counts["incomplete_group"] += len(group_samples)
+                return []
 
         if dynamic_filtering and group_samples:
             # Compaction can emit several step-samples with the same terminal score. Keep one
@@ -376,20 +408,27 @@ class SamplesGenerator:
     ) -> Tuple[List[Experience], int, bool]:
         """Generate a batch of Experiences with optional reward filtering.
 
-        Dispatches num_prompts across the runner actors (which generate through the
-        vllm-router), collects all results, and returns. When dynamic_filtering is
-        enabled, filtered prompts are replaced with new ones.
+        Dispatches num_prompts to the rollout producer, collects all results, and
+        returns. When dynamic_filtering is enabled, filtered prompts are replaced
+        with new ones.
         """
         prompts_consumed = 0
         accepted_experiences: List[Experience] = []
         drop_counts: Dict[str, int] = defaultdict(int)
 
-        prompts, labels, images, tools, exhausted = _collect_prompt_batch(dataloader_iter, num_prompts)
+        prompts, labels, images, tools, task_specs, exhausted = _collect_prompt_batch(dataloader_iter, num_prompts)
         if not prompts:
             return [], prompts_consumed, True
 
         target_num_prompts = len(prompts)
-        pending_refs = self._dispatch_to_agent_runners(prompts, labels, images=images, tools=tools, **generate_kwargs)
+        pending_refs = self._dispatch_rollouts(
+            prompts,
+            labels,
+            images=images,
+            tools=tools,
+            task_specs=task_specs,
+            **generate_kwargs,
+        )
         prompts_consumed += target_num_prompts
 
         pbar = tqdm(range(target_num_prompts), desc="Generate samples")
@@ -413,13 +452,18 @@ class SamplesGenerator:
                     # already-generated valid experiences (and an accurate
                     # prompts_consumed count) instead of discarding work at the
                     # dataloader boundary.
-                    new_prompts, new_labels, new_images, new_tools, exhausted = _collect_prompt_batch(
+                    new_prompts, new_labels, new_images, new_tools, new_task_specs, exhausted = _collect_prompt_batch(
                         dataloader_iter, 1
                     )
                     prompts_consumed += len(new_prompts)
                     if new_prompts:
-                        new_refs = self._dispatch_to_agent_runners(
-                            new_prompts, new_labels, images=new_images, tools=new_tools, **generate_kwargs
+                        new_refs = self._dispatch_rollouts(
+                            new_prompts,
+                            new_labels,
+                            images=new_images,
+                            tools=new_tools,
+                            task_specs=new_task_specs,
+                            **generate_kwargs,
                         )
                         pending_refs.extend(new_refs)
 
@@ -427,12 +471,65 @@ class SamplesGenerator:
             logger.info(f"Eval rollout drops: {dict(drop_counts)}")
         return accepted_experiences, prompts_consumed, exhausted
 
-    def _dispatch_to_agent_runners(
-        self, prompts: List[str], labels: List[str], *, images: List = None, tools: List = None, **generate_kwargs
-    ) -> List:
-        """Round-robin each prompt group onto the runner actors; each ``run_group`` returns a
-        Ray ref of that group's Trajectories, consumed by the streaming loop / filtering /
-        experience maker exactly as before."""
+    def _dispatch_rollouts(
+        self,
+        prompts: list[str],
+        labels: list[str],
+        *,
+        images: list | None = None,
+        tools: list | None = None,
+        task_specs: list | None = None,
+        **generate_kwargs,
+    ) -> list:
+        """Submit prompt groups to Polar, or to the frozen R3/VLM legacy path."""
+        if self.polar_rollout is not None:
+            if task_specs is None:
+                task_specs = [None] * len(prompts)
+            sampling_params = {
+                "max_tokens": generate_kwargs.get("max_new_tokens"),
+                "max_total_tokens": generate_kwargs.get("max_len", self.args.data.max_len),
+                "temperature": generate_kwargs.get("temperature", 1.0),
+                "top_p": generate_kwargs.get("top_p", 1.0),
+                "top_k": generate_kwargs.get("top_k", -1),
+                "min_tokens": generate_kwargs.get("min_new_tokens", 1),
+                "min_p": 0.0,
+                "repetition_penalty": 1.0,
+                "frequency_penalty": 0.0,
+                "presence_penalty": 0.0,
+                "seed": None,
+                "skip_special_tokens": False,
+                "ignore_eos": False,
+                "include_stop_str_in_output": False,
+                "logprobs": 1,
+                "n": 1,
+            }
+            n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
+            refs = []
+            for prompt, row_spec in zip(prompts, task_specs, strict=True):
+                if not isinstance(prompt, str):
+                    raise TypeError("Polar task instructions must be strings")
+                if row_spec is not None and self.task_spec is not None:
+                    raise ValueError("Choose either --rollout.task_spec or row-level task specifications, not both")
+                spec = TaskSpec.model_validate(row_spec) if row_spec is not None else self.task_spec
+                if spec is None:
+                    raise ValueError("A Polar task specification is required")
+                request = TaskRequest(
+                    task_id=uuid4().hex,
+                    instruction=prompt,
+                    num_samples=n_samples,
+                    timeout_seconds=self.args.rollout.session_timeout,
+                    runtime=spec.runtime,
+                    agent=spec.agent,
+                    builder=spec.builder,
+                    evaluator=spec.evaluator,
+                    sampling_params=sampling_params,
+                    metadata=spec.metadata,
+                )
+                refs.append(self.polar_rollout.run_task.remote(request.model_dump(mode="json")))
+            return refs
+
+        from vllm import SamplingParams
+
         sampling_params = SamplingParams(
             temperature=generate_kwargs.get("temperature", 1.0),
             top_p=generate_kwargs.get("top_p", 1.0),
@@ -457,6 +554,72 @@ class SamplesGenerator:
                 actor.run_group.remote(prompt, label, img, sampling_params, truncate_length, n_samples, tools=tool)
             )
         return refs
+
+    @staticmethod
+    def _process_polar_task_result(task_result, max_length: int):
+        """Convert every trainable Polar trace into a Molt Experience."""
+        task = TaskStatus.model_validate(task_result)
+        converted = []
+        if not task.results:
+            return [(None, f"task_{task.status}")]
+
+        for session in task.results:
+            if session.task_id != task.task_id:
+                converted.append((None, "identity_mismatch"))
+                continue
+
+            for trace in session.trajectory.traces:
+                if not trace.prompt_ids:
+                    converted.append((None, "empty_prompt_tokens"))
+                    continue
+
+                sequence_ids = trace.prompt_ids + trace.response_ids
+                if len(sequence_ids) > max_length:
+                    converted.append((None, "sequence_too_long"))
+                    continue
+                if not any(trace.loss_mask):
+                    converted.append((None, "no_action_tokens"))
+                    continue
+                if trace.reward is None:
+                    converted.append((None, "missing_reward"))
+                    continue
+
+                token_mask = [0] * len(trace.prompt_ids) + trace.loss_mask
+                token_logprobs = [0.0] * len(trace.prompt_ids) + trace.response_logprobs
+                reward = float(trace.reward)
+                info = {
+                    "reward": torch.tensor([reward]),
+                    "score": torch.tensor([reward]),
+                }
+                for name, value in session.timing.model_dump().items():
+                    info[f"polar/{name}"] = torch.tensor([value])
+
+                converted.append(
+                    (
+                        Experience(
+                            sequences=torch.tensor([sequence_ids], dtype=torch.long),
+                            attention_mask=torch.ones((1, len(sequence_ids)), dtype=torch.long),
+                            action_mask=torch.tensor([token_mask[1:]], dtype=torch.bool),
+                            rollout_log_probs=torch.tensor([token_logprobs[1:]]),
+                            prompts=[task.instruction],
+                            labels=[""],
+                            images=[None],
+                            mm_train_inputs=[None],
+                            group_ids=[task.task_id],
+                            rollout_ids=[session.session_id],
+                            rewards=torch.tensor([reward]),
+                            scores=torch.tensor([reward]),
+                            response_length=torch.tensor([sum(trace.loss_mask)]),
+                            truncated=torch.tensor([trace.finish_reason == "length"]),
+                            total_length=torch.tensor([len(sequence_ids)]),
+                            info=info,
+                        ),
+                        None,
+                    )
+                )
+            if session.status != SessionStatus.COMPLETED and not session.trajectory.traces:
+                converted.append((None, f"session_{session.status.lower()}"))
+        return converted
 
     @staticmethod
     def _process_response_into_experience(
@@ -499,8 +662,8 @@ class SamplesGenerator:
                 )
                 return None, "vlm_truncation"
 
-        reward_val = _to_scalar(response.reward)
-        score_val = _to_scalar(response.scores)
+        reward_val = first_scalar(response.reward)
+        score_val = first_scalar(response.scores)
 
         sequences = torch.tensor(trajectory_tokens, dtype=torch.long)
         attention_mask = torch.ones(len(trajectory_tokens), dtype=torch.long)
@@ -553,7 +716,7 @@ class SamplesGenerator:
         # Convert extra logs to tensors for downstream consumers. Skip non-numeric values (e.g. string
         # task ids) — `torch.tensor([str])` raises "too many dimensions 'str'".
         for key, value in (response.extra_logs or {}).items():
-            value = _to_scalar(value)
+            value = first_scalar(value)
             if isinstance(value, (int, float, bool)):
                 info[key] = torch.tensor([value])
 

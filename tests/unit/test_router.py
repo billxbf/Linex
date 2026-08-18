@@ -26,6 +26,7 @@ import pytest
 from molt.trainer.rollout.router import (
     AgentRunnerActor,
     RouterGenerateClient,
+    VllmRouterActor,
     _align_features_to_canonical,
     _decode_routed_experts,
 )
@@ -266,3 +267,25 @@ def test_agent_runner_actor_init_is_synchronous():
     """Ray actor constructors are synchronous; an async __init__ would not be awaited."""
     actor_cls = getattr(AgentRunnerActor, "__ray_actor_class__", AgentRunnerActor)
     assert not inspect.iscoroutinefunction(actor_cls.__init__)
+
+
+def test_vllm_router_close_reaps_subprocess():
+    events = []
+
+    class Process:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            events.append("terminate")
+
+        def wait(self, timeout=None):
+            events.append(("wait", timeout))
+
+    actor_cls = getattr(VllmRouterActor, "__ray_actor_class__", VllmRouterActor)
+    actor = object.__new__(actor_cls)
+    actor._proc = Process()
+
+    actor.close()
+
+    assert events == ["terminate", ("wait", 10)]

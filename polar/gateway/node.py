@@ -163,6 +163,7 @@ class GatewayNodeManager:
                 task_id=request.task_id,
                 registered=True,
                 status=SessionStatus.REGISTERED,
+                sampling_params=request.sampling_params,
                 metadata=dict(request.metadata),
             )
             self.storage.ensure_session(

@@ -121,7 +121,13 @@ class RolloutRayActor:
         """Confirm Ray actor construction has completed."""
         return True
 
-    async def serve_openai(self, host: str = "0.0.0.0", port: int = 0) -> str:
+    async def serve_openai(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 0,
+        tool_call_parser: Optional[str] = None,
+        reasoning_parser: Optional[str] = None,
+    ) -> str:
         """Mount vLLM's OpenAI API server on THIS engine and return its URL.
 
         The router (vllm-router) fronts these per-engine servers for generation; we keep
@@ -144,6 +150,11 @@ class RolloutRayActor:
         args.model = self.kwargs.get("model")
         args.served_model_name = ["policy"]  # clients request model="policy"
         args.host, args.port = host, port
+        if tool_call_parser:
+            args.enable_auto_tool_choice = True
+            args.tool_call_parser = tool_call_parser
+        if reasoning_parser:
+            args.reasoning_parser = reasoning_parser
 
         supported_tasks = await self.llm.get_supported_tasks()
         model_config = self.llm.model_config
