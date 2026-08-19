@@ -30,12 +30,16 @@ One `python -m molt.cli.train_rl_ray` job starts the complete stack:
 1. Ray-managed vLLM engines and one vLLM router.
 2. Ray-managed Polar rollout and gateway services.
 3. Container sessions for each prompt group.
-4. Polar `Trace` records converted directly into Molt `Experience` batches.
+4. Polar `Trace` records and their media references converted directly
+   into Molt `Experience` batches.
 5. Molt policy optimization and coordinated weight synchronization.
 
 Molt derives gateway URLs, router URL, served model, and concurrency after Ray
 placement. It writes the resolved `topology.json` under
-`--rollout.save_dir`; users do not author or launch a second topology.
+`--rollout.save_dir`. The same directory is the shared root for VLM media and
+other retained rollout outputs; users do not configure another artifact path.
+On multi-node runs, that path must be visible at the same absolute location on
+every Ray node.
 
 ## Task configuration
 
@@ -53,8 +57,9 @@ python -m molt.cli.train_rl_ray \
   ...
 ```
 
-The YAML owns only Polar fields: `runtime`, `agent`, `builder`, `evaluator`,
-and optional metadata. Molt CLI flags remain the sole owner of sampling,
+The RL dataset owns only the string task instruction and an optional complete
+Polar task specification. The task YAML owns `runtime`, `agent`, `builder`,
+`evaluator`, and optional metadata. Molt CLI flags remain the sole owner of sampling,
 samples per prompt, batching, gateway count/concurrency, session timeout,
 persistence, and asynchronous/partial rollout policy.
 
@@ -77,11 +82,11 @@ across a policy update.
 - [Calculator](examples/polar/calculator/README.md): smallest complete optimizer-step smoke test.
 - [SWE-bench Verified](examples/polar/swebench_verified/README.md): per-instance runtime and evaluator rows.
 - [TMax-15K-Harbor](examples/polar/tmax-15k/README.md): terminal-agent tasks and Harbor rewards.
-- [Count Stars](examples/polar/count_stars/README.md): retained VLM fixture; integration is explicitly deferred.
+- [Count Stars](examples/polar/count_stars/README.md): one-step VLM artifact smoke test.
 
-R3 routing replay, VLM rollout, and container-based on-policy distillation stay
-on the frozen legacy path or fail fast when combined with Polar, pending their
-shared-artifact migrations. Direct text-agent rollout through
-`--train.agent_path` is not supported.
+Text and VLM agent rollouts all run through Polar. Media stays in the shared run
+directory while task results carry only paths.
+On-policy distillation and Molt's former direct-agent rollout interface are not
+part of Linex.
 
 If you are an agent editing this repository, read `AGENTS.md` first.

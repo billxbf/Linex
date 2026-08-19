@@ -17,8 +17,6 @@ from polar.rollout.models import (
     NodeHeartbeatRequest,
     NodeRegistrationRequest,
     SessionResult,
-    TaskRequest,
-    TaskStatus,
 )
 from polar.rollout.pipeline import Pipeline
 
@@ -99,28 +97,6 @@ app = FastAPI(title="Polar Rollout", version="0.1.0", lifespan=_lifespan)
 async def health():
     state = get_state()
     return {"status": "ok", "nodes": len(state.scheduler.list_nodes())}
-
-
-@app.post("/rollout/task/submit")
-async def submit_task_async(request: TaskRequest):
-    """Non-blocking task submission. Returns immediately with task_id.
-
-    Poll ``GET /rollout/task/{task_id}`` until status becomes terminal.
-    """
-    state = get_state()
-    try:
-        task_id = await state.manager.submit_task(request)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {"task_id": task_id, "status": "running"}
-
-
-@app.get("/rollout/task/{task_id}", response_model=TaskStatus)
-async def get_task(task_id: str):
-    task = get_state().manager.get_task(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return task
 
 
 @app.get("/rollout/status")

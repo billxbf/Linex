@@ -93,16 +93,11 @@ class PolarServiceActor:
     async def run_task(self, payload: dict) -> dict:
         if self.service != "rollout" or self._client is None:
             raise RuntimeError("run_task is only available on a started rollout server")
+        from polar.rollout.server import get_state
+
         request = TaskRequest.model_validate(payload)
-        response = await self._client.post("/rollout/task/submit", json=request.model_dump(mode="json"))
-        response.raise_for_status()
-        while True:
-            response = await self._client.get(f"/rollout/task/{request.task_id}")
-            response.raise_for_status()
-            result = response.json()
-            if result["status"] != "running":
-                return result
-            await asyncio.sleep(0.2)
+        result = await get_state().manager.run_task(request)
+        return result.model_dump(mode="json")
 
     async def pause(self, timeout_seconds: float = 300.0) -> dict:
         if self.service != "gateway":

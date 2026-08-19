@@ -6,7 +6,6 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
 # ---------------------------------------------------------------------------
 # Strategy / evaluator specs
 # ---------------------------------------------------------------------------
@@ -56,6 +55,7 @@ class CompletionRecord(BaseModel):
     request: dict[str, Any] = Field(default_factory=dict)
     original_request: dict[str, Any] = Field(default_factory=dict)
     response: dict[str, Any] = Field(default_factory=dict)
+    media_paths: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -98,6 +98,7 @@ class Trace(BaseModel):
     finish_reason: str | None = None
     response_logprobs: list[float] | None = None
     reward: float | None = None
+    media_paths: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("loss_mask")

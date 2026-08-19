@@ -49,20 +49,6 @@ def get_model_parallel_size(args) -> int:
     return int(fsdp.cp_size) * int(fsdp.tp_size)
 
 
-def _fill_missing_routed_experts(items: List["Experience"]) -> None:
-    """Give un-routed samples (routed_experts=None) an all -1 (natural-routing) block sized to
-    their own sequence, so a batch mixing captured routing with None neither drops the routing
-    (leading None) nor crashes on None.size(-1) (trailing None) in the first-element merge."""
-    routed = next((it.routed_experts for it in items if it.routed_experts is not None), None)
-    if routed is None:  # all-None batches merge to None untouched; all-present skip the fill
-        return
-    layers, topk = routed.shape[-3:-1]  # fixed by the model; routed_experts is (..., L, topk, T)
-    for it in items:
-        if it.routed_experts is None:
-            *lead, seq = it.sequences.shape  # seq-aligned with sequences (..., T)
-            it.routed_experts = torch.full((*lead, layers, topk, seq), -1, dtype=routed.dtype)
-
-
 @dataclass
 class Experience:
     """A batch of RL experience for policy optimization.
@@ -88,12 +74,6 @@ class Experience:
     action_log_probs: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) log pi_theta(a|s)
     base_action_log_probs: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) log pi_ref(a|s)
     rollout_log_probs: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) log pi_old(a|s)
-    # R3 rollout routing replay: the rollout router's top-k expert ids per token, one row
-    # per MoE layer. Stored seq-LAST as (B, num_moe_layers, topk, T) so it rides the same
-    # right-pad/concat/stack machinery as the (B, T) step tensors; the actor forward
-    # permutes it back to token-major and replays it. None when R3 off.
-    routed_experts: torch.Tensor = tensor_field("step", default=None)
-
     # Policy-gradient targets
     returns: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) G_t (PPO: value-regression target)
     advantages: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) A(s,a)
@@ -114,8 +94,6 @@ class Experience:
 
     # Metadata (not part of RL computation)
     prompts: list[str] = field(default_factory=list)
-    labels: list[str] = field(default_factory=list)
-    images: list = field(default_factory=list)  # per-sample image paths/URLs for VLM (None entries for text-only)
     mm_train_inputs: list = field(default_factory=list)  # per-sample processor outputs (pixel_values dicts) for VLM
     info: dict = field(default_factory=dict)  # per-sample metrics for logging
     # GRPO grouping identity. `group_ids` (= prompt id) is shared by all N rollouts of one
@@ -126,21 +104,19 @@ class Experience:
     rollout_ids: list[str] = field(default_factory=list)
 
     # Distributed rollout: when set, the heavy tensors below (HEAVY_FIELDS) live in the object
-    # store — produced and kept on the runner that generated the sample — and this holds the ref
+    # store — produced and kept on the generator actor — and this holds the ref
     # to them. The lightweight fields (masks, rewards, ids, info) stay in place, so the controller
-    # groups, scores and length-balances the sample without ever fetching its images. `reload()`
+    # groups, scores and length-balances the sample without fetching model inputs. `reload()`
     # restores the heavy tensors on whichever rank consumes the sample. None once the sample is local.
     heavy_ref: Any = None
 
-    # The fields offloaded to `heavy_ref` — everything the training forward needs (image bytes +
-    # pixel_values, token ids, rollout routing) but the controller's advantage/length-balance logic
-    # does not, so they never reach the controller. Rule: keep only what the controller reads light;
-    # offload the rest (a byte-embedded `images` dataset column can be large).
-    HEAVY_FIELDS = ("sequences", "attention_mask", "rollout_log_probs", "routed_experts", "mm_train_inputs", "images")
+    # The fields offloaded to `heavy_ref` are needed by the training forward but not by
+    # controller-side grouping, filtering, or length balancing.
+    HEAVY_FIELDS = ("sequences", "attention_mask", "rollout_log_probs", "mm_train_inputs")
 
     def offload(self) -> "Experience":
-        """Move this sample's heavy fields into the object store (on the producing runner) and keep
-        only a ref, so the controller ships a handle, not images. Returns self. Undo with `reload()`.
+        """Move this sample's heavy fields into the generator actor's object store and keep
+        only a ref, so the controller ships a handle, not model inputs. Returns self. Undo with `reload()`.
         Idempotent (like `reload()`): a no-op if already offloaded, so a second call never re-puts the
         now-nulled fields and overwrites the ref."""
         if self.heavy_ref is not None:
@@ -152,8 +128,10 @@ class Experience:
         return self
 
     def reload(self) -> "Experience":
-        """Restore the heavy fields from the object store — fetched peer-to-peer from wherever they
-        live (the producing runner), never via the controller. Idempotent: a no-op if already local."""
+        """Restore the heavy fields from the object store without routing them through the controller.
+
+        Idempotent: a no-op if already local.
+        """
         if self.heavy_ref is not None:
             heavy = ray.get(self.heavy_ref)
             for name, value in heavy.items():
@@ -226,11 +204,6 @@ def make_experience_batch(items: List[Experience]) -> Experience:
     if not items:
         raise ValueError("Empty items list")
 
-    # A rollout with no captured routing has routed_experts=None; fill it (sized to its own
-    # sequence) before batching so a mix doesn't drop the batch's routing or crash on
-    # None.size(-1).
-    _fill_missing_routed_experts(items)
-
     kwargs = {}
     for f in fields(Experience):
         first = getattr(items[0], f.name)
@@ -239,10 +212,7 @@ def make_experience_batch(items: List[Experience]) -> Experience:
         elif isinstance(first, torch.Tensor):
             tensors = [getattr(item, f.name) for item in items]
             if Experience.is_step_tensor_field(f.name):
-                # routed_experts pads with the R3 -1 sentinel (keep live routing); 0 is a
-                # valid expert id and would force pad tokens to expert 0. Others pad with 0.
-                pad_value = -1 if f.name == "routed_experts" else 0
-                kwargs[f.name] = zero_pad_sequences(tensors, "right", stack=True, value=pad_value)
+                kwargs[f.name] = zero_pad_sequences(tensors, "right", stack=True, value=0)
             elif Experience.is_episode_tensor_field(f.name) or first.dim() == 0:
                 kwargs[f.name] = torch.stack(tensors)
             else:
@@ -275,8 +245,6 @@ def remove_padding_in_sequences(items: List[Experience]) -> List[Experience]:
         for f in fields(Experience):
             value = getattr(item, f.name)
             if isinstance(value, torch.Tensor) and Experience.is_step_tensor_field(f.name):
-                # Slice the LAST (sequence) dim: 1D step tensors are [T], but
-                # routed_experts is [num_moe_layers, topk, T] (seq last).
                 setattr(item, f.name, value[..., :right_pad])
 
     return items

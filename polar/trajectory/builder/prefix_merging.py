@@ -171,10 +171,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
             # Canonical-vs-canonical prefix check: both sides are server-side
             # tokenizations of the same message prefix — matches reliably
             # unless the harness rewrote prior messages.
-            if (
-                len(Ci_prompt_ids) < len(prev_prompt_ids)
-                or Ci_prompt_ids[: len(prev_prompt_ids)] != prev_prompt_ids
-            ):
+            if len(Ci_prompt_ids) < len(prev_prompt_ids) or Ci_prompt_ids[: len(prev_prompt_ids)] != prev_prompt_ids:
                 logger.debug(
                     "prefix_merging: canonical prefix break at step %d/%d",
                     i,
@@ -183,7 +180,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
                 break
 
             # canonical_tail = canonical tokens for [prev assistant msg + new interstitials].
-            canonical_tail = Ci_prompt_ids[len(prev_prompt_ids):]
+            canonical_tail = Ci_prompt_ids[len(prev_prompt_ids) :]
             interstitial = self._slice_interstitial(
                 canonical_tail=canonical_tail,
                 prev_raw_response=prev_raw_response,
@@ -191,8 +188,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
             )
             if interstitial is None:
                 logger.debug(
-                    "prefix_merging: interstitial split failed at step %d/%d "
-                    "(eot_id=%r, tail_len=%d)",
+                    "prefix_merging: interstitial split failed at step %d/%d (eot_id=%r, tail_len=%d)",
                     i,
                     len(chain),
                     eot_id,
@@ -225,7 +221,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         else:
             stats["chains_reconstructed_truncated"] += 1
 
-        response_ids = stream_ids[len(prompt_ids):]
+        response_ids = stream_ids[len(prompt_ids) :]
         response_logprobs = self._finalize_logprobs(response_slots, loss_mask)
         last_kept_trace = build_trace_from_completion(chain[kept - 1])
 
@@ -238,6 +234,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
             tools=deepcopy(first_trace.tools),
             finish_reason=last_kept_trace.finish_reason,
             response_logprobs=response_logprobs,
+            media_paths=list(last_kept_trace.media_paths),
             metadata=self._chain_metadata(chain[:kept]),
         )
 
@@ -256,10 +253,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
             return self._configured_eot_id
         for completion in chain:
             trace = build_trace_from_completion(completion)
-            if (
-                trace.finish_reason in _NATURAL_STOP_REASONS
-                and trace.response_ids
-            ):
+            if trace.finish_reason in _NATURAL_STOP_REASONS and trace.response_ids:
                 return trace.response_ids[-1]
         return None
 

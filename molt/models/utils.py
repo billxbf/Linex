@@ -66,7 +66,7 @@ def compute_approx_kl(
 
     if kl_estimator == "k1":
         # Signed log-ratio p - q, returned unclamped: the nan_to_num above already
-        # bounds true infinities to ±30, and on-policy distillation consumes this as
+        # bounds true infinities to ±30, and KL-as-reward consumes this as
         # a dense per-token reward (advantage = -kl_coef * kl) that must not be capped
         # on the most-divergent tokens (matches slime, which never clamps it). Only the
         # non-negative loss-side estimators (k2/k3) get the ±10 bound below.

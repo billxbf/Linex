@@ -119,8 +119,8 @@ def normalize_advantages(advantages: List[torch.Tensor], ctx: AdvantageContext) 
 
 
 # Estimators that normalize rewards within a prompt group; only these need the
-# rollout-reward merge (one reward per rollout, grouped by prompt). reinforce / gae /
-# on_policy_distill score each sample independently, so in multi-turn rollouts that
+# rollout-reward merge (one reward per rollout, grouped by prompt). reinforce and
+# gae score each sample independently, so in multi-turn rollouts that
 # split one trajectory into several samples they must NOT merge (see compute_advantages).
 GROUP_ADVANTAGE_ESTIMATORS = frozenset({"grpo", "dr_grpo", "reinforce_baseline", "rloo"})
 
@@ -162,26 +162,6 @@ def reinforce(
         returns.append(seq_returns)
 
     return normalize_advantages(returns, ctx), returns
-
-
-@register_advantage_estimator("on_policy_distill")
-def on_policy_distill(
-    rewards: torch.Tensor, groups: List[List[int]], ctx: AdvantageContext
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """On-policy distillation (slime / Thinking Machines): the dense per-token training
-    signal is the *reverse* KL to a frozen teacher, which here is just the reference model.
-
-    With ``--algo.kl.estimator k1`` each ``ctx.kls`` entry is the per-token ``log pi_student -
-    log pi_teacher``, so the advantage is ``-kl_coef * kl = kl_coef * (log pi_teacher -
-    log pi_student)`` — the negative per-token reverse KL. No scalar task reward, no group
-    baseline, no whitening, discount 0 (immediate per-token term only). The policy loss then
-    gives the standard policy-gradient estimator of the reverse-KL gradient, so the student is
-    pulled onto the teacher on its *own* on-policy samples. Point the teacher at a (bigger)
-    checkpoint with ``--ref.model_name_or_path`` and set the strength with ``--algo.kl.init_coef``;
-    keep ``--algo.kl.use_loss`` off so the KL flows through the advantage, not a separate loss term.
-    """
-    returns = [(-ctx.kl_coef * kl) * mask for kl, mask in zip(ctx.kls, ctx.action_masks)]
-    return [ret.clone() for ret in returns], returns
 
 
 @register_advantage_estimator("reinforce_baseline")

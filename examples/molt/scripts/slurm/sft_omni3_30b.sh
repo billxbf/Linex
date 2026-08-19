@@ -28,7 +28,7 @@
 # Nemotron Omni3 (NemotronH_Nano_Omni_Reasoning_V3) VLM SFT.
 # Default config = 32K + CP8 + EP8 + deepep + AC: the trainer delegates CP to the
 # Actor (RL contract); 2 nodes (16 GPUs) → CP8 shards the 32K sequence to 4K/rank,
-# DP=2. Mirrors slurm/rl_omni3_30b.sh:
+# DP=2. Key model settings:
 #   - Native AutoModel path (NemotronOmniForConditionalGeneration). TE is the
 #     fused-attention backend (flash_attention_2 silently falls to sdpa) and is
 #     required for CP>1.

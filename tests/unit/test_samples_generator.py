@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from PIL import Image
 
 if "ray" not in sys.modules:
     fake_ray = types.ModuleType("ray")
@@ -52,29 +53,21 @@ if "ray" not in sys.modules:
     sys.modules["ray.util"] = fake_util
     sys.modules["ray.util.placement_group"] = fake_placement_group
     sys.modules["ray.util.scheduling_strategies"] = fake_scheduling
-if "vllm" not in sys.modules:
-    fake_vllm = types.ModuleType("vllm")
-
-    class SamplingParams:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-
-    fake_vllm.SamplingParams = SamplingParams
-    sys.modules["vllm"] = fake_vllm
-
-from molt.agents.base import Trajectory
 from molt.trainer.rollout import samples_generator
 from molt.trainer.rollout.samples_generator import SamplesGenerator
 from polar.rollout.models import TaskSpec
 
 
-def _sample(group_id):
-    return SimpleNamespace(group_ids=[group_id])
+def _sample(group_id, **fields):
+    fields.setdefault("rollout_ids", [group_id])
+    sample = SimpleNamespace(group_ids=[group_id], **fields)
+    sample.offload = lambda: sample
+    return sample
 
 
 def _prompt_loader(num_prompts):
-    """A dataloader yielding one prompt per item, as (index, prompts, labels, images, tools)."""
-    return [(i, [f"p{i}"], [f"l{i}"], [None], [None]) for i in range(num_prompts)]
+    """A dataloader yielding one Polar instruction and optional task per item."""
+    return [([f"d{i}"], [f"p{i}"], [None]) for i in range(num_prompts)]
 
 
 def _wire_fake_vllm(generator, monkeypatch, to_sample):
@@ -82,12 +75,12 @@ def _wire_fake_vllm(generator, monkeypatch, to_sample):
 
     Each dispatched prompt becomes one in-flight rollout handle tagged with its prompt
     string; ray.wait hands them back in dispatch order and ray.get turns a handle into
-    the runner's result — a list of ``(light, drop_reason)`` (here one usable light that
+    the producer result — a list of ``(light, drop_reason)`` (here one usable light that
     ``to_sample`` maps from the prompt tag).
     """
-    generator._dispatch_rollouts = lambda prompts, labels, images, **kw: [
-        SimpleNamespace(group_id=prompt) for prompt in prompts
-    ]
+    generator._dispatch_rollouts = lambda prompts, **kw: [SimpleNamespace(group_id=prompt) for prompt in prompts]
+    generator._process_polar_task_result = lambda result, _max_length: result
+    generator.args.data = SimpleNamespace(max_len=2048)
     monkeypatch.setattr(
         samples_generator.ray, "wait", lambda handles, num_returns=1: ([handles[0]], list(handles[1:]))
     )
@@ -140,11 +133,13 @@ def _wire_eval_generator(generator, monkeypatch, num_prompts):
     generator.eval_dataloader = _prompt_loader(num_prompts)
     dispatch_sizes = []
 
-    def dispatch(prompts, labels, images, **kwargs):
+    def dispatch(prompts, **kwargs):
         dispatch_sizes.append(len(prompts))
         return [SimpleNamespace(group_id=prompt) for prompt in prompts]
 
     generator._dispatch_rollouts = dispatch
+    generator._process_polar_task_result = lambda result, _max_length: result
+    generator.args.data = SimpleNamespace(max_len=2048)
     monkeypatch.setattr(
         samples_generator.ray, "wait", lambda handles, num_returns=1, timeout=None: ([handles[0]], list(handles[1:]))
     )
@@ -225,7 +220,7 @@ def test_force_sync_mode_leaves_no_rollout_in_flight(monkeypatch):
 def test_generator_keeps_no_checkpoint_state_and_resumes_from_dataloader(monkeypatch):
     """The in-flight pool is intentionally NOT persisted.
 
-    Persisting the in-flight (prompt, label, images) payloads bloated checkpoints
+    Persisting in-flight task payloads bloated checkpoints
     ~1000x (22-78 MB vs ~7 KB) and crashed the driver on resume, so the generator
     is stateless across checkpoints: state_dict() is empty and load_state_dict is a
     no-op tolerant of None/{}. The StatefulDataLoader cursor already points past the
@@ -250,7 +245,7 @@ def test_generator_keeps_no_checkpoint_state_and_resumes_from_dataloader(monkeyp
     restored.args = generator.args
     # The StatefulDataLoader cursor in the checkpoint already points past the
     # prefetched prompts (p0-p6 were read), so resume starts at p7.
-    restored.prompts_dataloader = [(i, [f"p{i}"], [f"l{i}"], [None], [None]) for i in range(7, 10)]
+    restored.prompts_dataloader = [([f"d{i}"], [f"p{i}"], [None]) for i in range(7, 10)]
     _wire_fake_vllm(restored, monkeypatch, _sample)
     restored.load_state_dict(None)  # tolerate a missing payload
     restored.load_state_dict({})  # and an empty one
@@ -273,7 +268,7 @@ def test_generate_samples_drops_filtered_groups_and_refills_their_slots(monkeypa
     group_score = {"p0": 0.5, "p1": 1.0, "p2": 0.5, "p3": 0.5}
 
     def scored_sample(group_id):
-        return SimpleNamespace(group_ids=[group_id], scores=[torch.tensor(group_score[group_id])])
+        return _sample(group_id, scores=[torch.tensor(group_score[group_id])])
 
     _wire_fake_vllm(generator, monkeypatch, scored_sample)
 
@@ -295,12 +290,12 @@ def test_dynamic_filtering_counts_compaction_segments_once_per_rollout(monkeypat
         algo=SimpleNamespace(dynamic_filtering_range=(0.4, 0.6)),
     )
     samples = [
-        SimpleNamespace(rollout_ids=[rollout_id], scores=torch.tensor([score]))
+        _sample("group", rollout_ids=[rollout_id], scores=torch.tensor([score]))
         for rollout_id, score in [("a", 1.0), ("a", 1.0), ("a", 1.0), ("b", 0.0)]
     ]
-    # run_group now builds each response into a (light Experience, drop_reason) on the runner;
-    # _filter_group just unpacks and applies the DAPO group filter.
     monkeypatch.setattr(samples_generator.ray, "get", lambda _: [(sample, None) for sample in samples])
+    generator._process_polar_task_result = lambda result, _max_length: result
+    generator.args.data = SimpleNamespace(max_len=2048)
     score_stats = defaultdict(float)
 
     kept = generator._filter_group(object(), True, defaultdict(int), score_stats=score_stats)
@@ -309,83 +304,10 @@ def test_dynamic_filtering_counts_compaction_segments_once_per_rollout(monkeypat
     assert dict(score_stats) == {"score_sum": 1.0, "score_n": 2, "groups": 1.0, "all_pass": 0.0, "all_fail": 0.0}
 
 
-def test_process_response_counts_only_action_tokens_for_multiturn_lengths():
-    experience, drop_reason = SamplesGenerator._process_response_into_experience(
-        Trajectory(
-            prompt="p",
-            label="l",
-            images=None,
-            observation_text="",
-            observation_tokens=list(range(8)),
-            action_ranges=[(2, 4), (6, 7)],
-            rollout_log_probs=[float(i) for i in range(8)],
-            reward=1.0,
-            scores=1.0,
-        ),
-        media_ids=set(),
-        truncate_length=8,
-    )
-
-    assert drop_reason is None
-    assert experience.response_length.item() == 3
-    assert experience.action_mask.sum().item() == 3
-    torch.testing.assert_close(
-        experience.action_mask,
-        torch.tensor([[False, True, True, False, False, True, False]]),
-    )
-    torch.testing.assert_close(
-        experience.rollout_log_probs,
-        torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]]),
-    )
-
-
-def test_process_response_rejects_action_ranges_outside_trajectory():
-    with pytest.raises(ValueError, match="Invalid action range"):
-        SamplesGenerator._process_response_into_experience(
-            Trajectory(
-                prompt="p",
-                label="l",
-                images=None,
-                observation_text="",
-                observation_tokens=[0, 1, 2],
-                action_ranges=[(2, 4)],
-                rollout_log_probs=[0.0, 0.0, 0.0],
-                reward=1.0,
-                scores=1.0,
-            ),
-            media_ids=set(),
-            truncate_length=8,
-        )
-
-
-def test_process_response_skips_misaligned_rollout_logprobs():
-    experience, drop_reason = SamplesGenerator._process_response_into_experience(
-        Trajectory(
-            prompt="p",
-            label="l",
-            images=None,
-            observation_text="",
-            observation_tokens=[0, 1, 2],
-            action_ranges=[(1, 3)],
-            rollout_log_probs=[0.0, 0.0],
-            reward=1.0,
-            scores=1.0,
-        ),
-        media_ids=set(),
-        truncate_length=8,
-    )
-
-    assert experience is None
-    assert drop_reason == "logprob_misalign"
-
-
 def _polar_task_result(traces, *, session_id="session-1"):
     return {
         "task_id": "task-1",
         "instruction": "Fix the program",
-        "status": "completed",
-        "total_sessions": 1,
-        "completed_sessions": 1,
         "results": [
             {
                 "session_id": session_id,
@@ -396,6 +318,12 @@ def _polar_task_result(traces, *, session_id="session-1"):
             }
         ],
     }
+
+
+def _converter(tokenizer=None):
+    generator = object.__new__(SamplesGenerator)
+    generator.tokenizer = tokenizer or SimpleNamespace()
+    return generator
 
 
 def test_polar_single_turn_trace_becomes_exact_experience():
@@ -412,7 +340,7 @@ def test_polar_single_turn_trace_becomes_exact_experience():
         ]
     )
 
-    [(experience, drop_reason)] = SamplesGenerator._process_polar_task_result(result, max_length=16)
+    [(experience, drop_reason)] = _converter()._process_polar_task_result(result, max_length=16)
 
     assert drop_reason is None
     torch.testing.assert_close(experience.sequences, torch.tensor([[10, 11, 20, 21]]))
@@ -428,6 +356,82 @@ def test_polar_single_turn_trace_becomes_exact_experience():
     assert experience.info["polar/run_ms"].item() == pytest.approx(15.0)
 
 
+def test_polar_trace_preserves_safe_molt_truncation_behavior():
+    result = _polar_task_result(
+        [
+            {
+                "prompt_ids": [1, 2],
+                "response_ids": [3, 4, 5],
+                "loss_mask": [1, 1, 1],
+                "response_logprobs": [-0.1, -0.2, -0.3],
+                "reward": 1.0,
+            }
+        ]
+    )
+
+    [(experience, drop_reason)] = _converter()._process_polar_task_result(result, max_length=4)
+
+    assert drop_reason is None
+    assert experience.sequences.tolist() == [[1, 2, 3, 4]]
+    assert experience.response_length.item() == 2
+    assert experience.truncated.item() is True
+    assert experience.info["response_clip_ratio"].item() is True
+
+
+def test_polar_vlm_trace_rejects_truncation_that_drops_media():
+    result = _polar_task_result(
+        [
+            {
+                "prompt_ids": [1, 2, 9],
+                "response_ids": [3],
+                "loss_mask": [1],
+                "response_logprobs": [-0.1],
+                "reward": 1.0,
+                "media_paths": ["unused.png"],
+            }
+        ]
+    )
+
+    assert _converter(SimpleNamespace(image_token_id=9))._process_polar_task_result(result, max_length=2) == [
+        (None, "vlm_truncation")
+    ]
+
+
+def test_polar_media_artifact_becomes_aligned_training_input(tmp_path):
+    image_path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4), "yellow").save(image_path)
+
+    class ImageProcessor:
+        merge_size = 2
+
+        def __call__(self, *, images, return_tensors):
+            assert len(images) == 1 and return_tensors == "pt"
+            return {
+                "pixel_values": torch.ones(1, 3, 4, 4),
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            }
+
+    tokenizer = SimpleNamespace(image_processor=ImageProcessor(), image_token_id=9)
+    result = _polar_task_result(
+        [
+            {
+                "prompt_ids": [1, 9],
+                "response_ids": [2, 3],
+                "loss_mask": [1, 1],
+                "response_logprobs": [-0.1, -0.2],
+                "reward": 1.0,
+                "media_paths": [str(image_path)],
+            }
+        ]
+    )
+
+    [(experience, drop_reason)] = _converter(tokenizer)._process_polar_task_result(result, max_length=16)
+
+    assert drop_reason is None
+    torch.testing.assert_close(experience.mm_train_inputs[0]["pixel_values"], torch.ones(1, 3, 4, 4))
+    assert experience.info["image_tokens"].item() == 1
+
+
 def test_polar_multiturn_tool_result_tokens_stay_masked():
     result = _polar_task_result(
         [
@@ -441,7 +445,7 @@ def test_polar_multiturn_tool_result_tokens_stay_masked():
         ]
     )
 
-    [(experience, drop_reason)] = SamplesGenerator._process_polar_task_result(result, max_length=16)
+    [(experience, drop_reason)] = _converter()._process_polar_task_result(result, max_length=16)
 
     assert drop_reason is None
     torch.testing.assert_close(experience.sequences, torch.tensor([[1, 2, 3, 4, 50, 5]]))
@@ -465,7 +469,7 @@ def test_polar_multi_trace_session_shares_rollout_identity():
         for token, reward in ((2, 1.0), (3, 0.5))
     ]
 
-    converted = SamplesGenerator._process_polar_task_result(_polar_task_result(traces), max_length=16)
+    converted = _converter()._process_polar_task_result(_polar_task_result(traces), max_length=16)
     experiences = [experience for experience, drop_reason in converted if drop_reason is None]
 
     assert len(experiences) == 2
@@ -477,9 +481,7 @@ def test_polar_conversion_rejects_task_identity_mismatch():
     result = _polar_task_result([])
     result["results"][0]["task_id"] = "other-task"
 
-    assert SamplesGenerator._process_polar_task_result(result, max_length=16) == [
-        (None, "identity_mismatch")
-    ]
+    assert _converter()._process_polar_task_result(result, max_length=16) == [(None, "identity_mismatch")]
 
 
 def test_polar_conversion_keeps_rewarded_trace_from_failed_session():
@@ -496,7 +498,7 @@ def test_polar_conversion_keeps_rewarded_trace_from_failed_session():
     )
     result["results"][0].update({"status": "ERROR", "error": "agent exited 1"})
 
-    [(experience, drop_reason)] = SamplesGenerator._process_polar_task_result(result, max_length=16)
+    [(experience, drop_reason)] = _converter()._process_polar_task_result(result, max_length=16)
 
     assert drop_reason is None
     assert experience.rewards.item() == 0.0
@@ -527,7 +529,6 @@ def test_polar_dispatch_uses_cli_sampling_and_task_spec():
 
     refs = generator._dispatch_rollouts(
         ["Fix it"],
-        ["ignored"],
         task_specs=[None],
         max_new_tokens=128,
         temperature=0.7,
@@ -552,7 +553,6 @@ def test_polar_dispatch_uses_cli_sampling_and_task_spec():
     with pytest.raises(ValueError, match="either --rollout.task_spec or row-level"):
         generator._dispatch_rollouts(
             ["Fix it"],
-            ["ignored"],
             task_specs=[generator.task_spec.model_dump(mode="json")],
         )
 
@@ -575,9 +575,7 @@ def test_task_spec_resolves_upload_sources_from_validation_context(tmp_path):
             "runtime": {
                 "image": "calculator:latest",
                 "prepare": [{"type": "upload_file", "source": "assets/input.py", "target": "/input.py"}],
-                "eval_prepare": [
-                    {"type": "upload_dir", "source": "assets/tests", "target": "/tests"}
-                ],
+                "eval_prepare": [{"type": "upload_dir", "source": "assets/tests", "target": "/tests"}],
             },
             "agent": {"harness": "codex"},
             "evaluator": {"strategy": "session_completed"},
@@ -591,7 +589,7 @@ def test_task_spec_resolves_upload_sources_from_validation_context(tmp_path):
 
 def test_warm_resume_state_dict_materializes_lazy_samples(tmp_path, monkeypatch):
     """Under distributed rollout every finished sample is offloaded (heavy_ref set). state_dict()
-    must MATERIALIZE a local copy (copy + reload) so the warm buffer survives a runner restart,
+    must MATERIALIZE a local copy (copy + reload) so the warm buffer survives an actor restart,
     while leaving the originals lazy so the current step still ships them cheaply."""
     import os
 
@@ -610,7 +608,7 @@ def test_warm_resume_state_dict_materializes_lazy_samples(tmp_path, monkeypatch)
     monkeypatch.setattr(exp_mod.ray, "put", fake_put)
     monkeypatch.setattr(exp_mod.ray, "get", lambda ref: store[ref])
 
-    # A finished-but-untrained sample, offloaded (lazy) exactly as the runner leaves it.
+    # A finished-but-untrained sample, offloaded (lazy) exactly as the generator leaves it.
     e = Experience(
         sequences=torch.tensor([[1, 2, 3]]),
         attention_mask=torch.tensor([[1, 1, 1]]),

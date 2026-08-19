@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import httpx
@@ -17,8 +15,6 @@ from polar.rollout.models import SessionContext, SessionDispatchRequest, Session
 from polar.trajectory.models import Trajectory
 
 logger = logging.getLogger(__name__)
-
-ResultCallback = Callable[[SessionResult], Awaitable[None] | None]
 
 
 def _trajectory_status(status: str) -> str:
@@ -74,16 +70,9 @@ class Pipeline:
                 self._client = None
             self._started = False
 
-    async def run_batch(
-        self,
-        sessions: list[SessionContext],
-        *,
-        on_result: ResultCallback | None = None,
-    ) -> list[SessionResult]:
+    async def run_batch(self, sessions: list[SessionContext]) -> list[SessionResult]:
         await self.start()
-        return await asyncio.gather(
-            *(self._dispatch_and_collect(session, on_result) for session in sessions)
-        )
+        return await asyncio.gather(*(self._dispatch_and_collect(session) for session in sessions))
 
     async def accept_callback_result(self, result: SessionResult) -> bool:
         async with self._pending_lock:
@@ -98,21 +87,12 @@ class Pipeline:
             "pending_sessions": len(self._pending),
         }
 
-    def result_path_for(self, task_id: str, session_id: str) -> str | None:
-        path = self._result_path(task_id, session_id)
-        return None if path is None else str(path)
-
-    async def _dispatch_and_collect(
-        self,
-        session: SessionContext,
-        callback: ResultCallback | None,
-    ) -> SessionResult:
+    async def _dispatch_and_collect(self, session: SessionContext) -> SessionResult:
         if self._client is None:
             raise RuntimeError("pipeline has not been started")
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        session.completion_future = future
         async with self._pending_lock:
             self._pending[session.session_id] = future
 
@@ -132,15 +112,8 @@ class Pipeline:
                 self._pending.pop(session.session_id, None)
 
         await asyncio.to_thread(self._persist_result, result)
-        session.rollout_result = result
-        try:
-            if callback is not None:
-                maybe_awaitable = callback(result)
-                if inspect.isawaitable(maybe_awaitable):
-                    await maybe_awaitable
-            return result
-        finally:
-            await self._cleanup_session(session)
+        await self._cleanup_session(session)
+        return result
 
     async def _dispatch_session(self, session: SessionContext) -> SessionDispatchRequest:
         if self._client is None:
@@ -178,18 +151,14 @@ class Pipeline:
                 response.raise_for_status()
                 return dispatch_request
             except Exception as exc:
-                if await self._accepted_duplicate_dispatch(
-                    exc, node.gateway_url, session, dispatch_request
-                ):
+                if await self._accepted_duplicate_dispatch(exc, node.gateway_url, session, dispatch_request):
                     return dispatch_request
                 self.scheduler.release_reservation(node.node_id)
                 self.scheduler.mark_unhealthy(node.node_id)
                 try:
                     remaining_timeout = self._remaining_timeout_seconds(session)
                 except TimeoutError:
-                    raise TimeoutError(
-                        "session timeout expired before gateway dispatch completed"
-                    ) from exc
+                    raise TimeoutError("session timeout expired before gateway dispatch completed") from exc
                 await asyncio.sleep(min(self.dispatch_poll_interval_seconds, remaining_timeout))
                 session.node_id = None
                 session.gateway_url = None
@@ -299,20 +268,13 @@ class Pipeline:
                 if not future.done():
                     future.set_result(result)
                 return result
-            if (
-                not execution_timeout_started
-                and status is not None
-                and status != SessionStatus.REGISTERED
-            ):
-                session.deadline_monotonic = (
-                    time.monotonic() + session.request.timeout_seconds
-                )
+            if not execution_timeout_started and status is not None and status != SessionStatus.REGISTERED:
+                session.deadline_monotonic = time.monotonic() + session.request.timeout_seconds
                 callback_deadline = self._callback_deadline_monotonic(session)
                 execution_timeout_started = True
 
         raise TimeoutError(
-            f"session {dispatch_request.session_id} did not return a terminal result "
-            "before the callback deadline"
+            f"session {dispatch_request.session_id} did not return a terminal result before the callback deadline"
         )
 
     async def _poll_session_state(
@@ -341,15 +303,6 @@ class Pipeline:
         # result. Keep polling until the payload lands or the callback expires.
         return status_value, None
 
-    async def _poll_session_result(
-        self,
-        session: SessionContext,
-        *,
-        timeout: float,
-    ) -> SessionResult | None:
-        _, result = await self._poll_session_state(session, timeout=timeout)
-        return result
-
     def _remaining_timeout_seconds(self, session: SessionContext) -> float:
         remaining = session.deadline_monotonic - time.monotonic()
         if remaining <= 0:
@@ -359,20 +312,12 @@ class Pipeline:
     def _callback_deadline_monotonic(self, session: SessionContext) -> float:
         return session.deadline_monotonic + self.callback_grace_seconds
 
-    def _remaining_callback_window_seconds(self, session: SessionContext) -> float:
-        remaining = self._callback_deadline_monotonic(session) - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("session callback deadline expired")
-        return remaining
-
     async def _cleanup_session(self, session: SessionContext) -> None:
         if self._client is None or session.gateway_url is None:
             return
 
         try:
-            response = await self._client.delete(
-                f"{session.gateway_url}/sessions/{session.session_id}"
-            )
+            response = await self._client.delete(f"{session.gateway_url}/sessions/{session.session_id}")
             if response.status_code not in {200, 404}:
                 response.raise_for_status()
         except Exception:
@@ -388,9 +333,7 @@ class Pipeline:
         if path is None:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(self._storage_payload(result), separators=(",", ":"), default=str)
-        )
+        path.write_text(json.dumps(self._storage_payload(result), separators=(",", ":"), default=str))
 
     def _result_path(self, task_id: str, session_id: str) -> Path | None:
         if self.save_dir is None:

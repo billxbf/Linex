@@ -17,4 +17,4 @@ class ShellHarness(BaseHarness):
         self._shell = agent_spec.custom_shell
 
     def run_steps(self, instruction: str) -> list[ExecInput]:
-        return [self._shell]
+        return [self._shell.model_copy(update={"env": {**(self._shell.env or {}), "POLAR_INSTRUCTION": instruction}})]

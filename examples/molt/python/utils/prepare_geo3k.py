@@ -13,17 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Convert VeraIsHere/geo3k_imgurl_processed to Molt schema.
+"""Convert VeraIsHere/geo3k_imgurl_processed to Molt VLM SFT schema.
 
 Source: https://huggingface.co/datasets/VeraIsHere/geo3k_imgurl_processed
 Geometric reasoning with a visible image and a numeric / boxed final answer.
-Used for both VLM SFT (single-turn QA) and VLM multi-turn RL (with the math
-tool-call env).
-
 Output schema (load_from_disk-compatible):
     datasource: str
     prompt: list[{role: "user", content: str}]   # chat-style, `<image>` literal
-    reward_model: {ground_truth: str, style: "rule"}
     response: list[{role: "assistant", content: str}]   # SFT target
     images: list[PIL.Image]
 """
@@ -38,49 +34,6 @@ from urllib.request import urlopen
 from datasets import load_dataset
 from PIL import Image
 
-# OpenAI-style function tool schema for the `python_executor` sandbox.
-# The tool runs an arbitrary Python snippet (with math / sympy / numpy
-# available) and returns stdout.
-# The chat template renders this into a system-side preamble so the model
-# emits `<tool_call>{...}</tool_call>` natively (no manual prompt engineering).
-GEO3K_TOOL_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "python_executor",
-        "description": (
-            "Run a Python snippet in a sandbox for math/geometry calculations. "
-            "Returns captured stdout (capped). math is preloaded; import sympy/numpy "
-            "yourself if needed. Use print() to read intermediate values. "
-            "Call as many times as needed to verify reasoning steps."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "Python source. Include print() for any value you want to read.",
-                },
-            },
-            "required": ["code"],
-        },
-    },
-}
-
-# Short instruction appended after the bare problem statement — the tool
-# schema above is what teaches the model the tool_call format. Pick the answer
-# wrapper that matches the model's pretraining distribution:
-#   * `boxed`  — `\boxed{...}` (Qwen / DeepSeek-Math convention)
-#   * `answer` — `<answer>...</answer>` (Nemotron Omni convention)
-# The grader accepts both, so swapping only changes what the model is asked to
-# emit; both wrappers grade identically downstream.
-_INSTRUCTION_HEAD = (
-    " Reason step by step inside <think>...</think>, calling python_executor as "
-    "needed to verify intermediate computations. Provide your final answer in "
-)
-ANSWER_WRAPPERS = {
-    "boxed": "\\boxed{}.",
-    "answer": "<answer>...</answer>.",
-}
 RESPONSE_WRAPPERS = {
     "boxed": "\\boxed{{{}}}",
     "answer": "<answer>{}</answer>",
@@ -144,13 +97,7 @@ _PROMPT_BOILERPLATE_RE = re.compile(
 
 
 def _strip_verbose_instructions(text: str) -> str:
-    """Drop the source dataset's hand-written tool_call instructions.
-
-    The chat template injects an OpenAI-style tool schema preamble via
-    `tools=`, so the verbose hand-rolled protocol in the source `problem`
-    field is redundant and bloats the prompt token budget. Keep only the
-    bare question + the <image> tag.
-    """
+    """Keep the source question while dropping its verbose answer protocol."""
     cleaned = _PROMPT_BOILERPLATE_RE.sub("", text)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
@@ -159,7 +106,7 @@ def _strip_verbose_instructions(text: str) -> str:
 def _format_row(example: dict[str, Any], answer_format: str = "boxed") -> dict[str, Any]:
     problem = str(example.get("problem") or example.get("question") or "").strip()
     answer = _extract_answer(example)
-    user_text = _strip_verbose_instructions(problem) + _INSTRUCTION_HEAD + ANSWER_WRAPPERS[answer_format]
+    user_text = _strip_verbose_instructions(problem)
     # Defensive: enforce exactly one <image> placeholder so the multimodal
     # processor's image_grid_thw lookup stays aligned with `images`.
     placeholder_count = user_text.count("<image>")
@@ -174,8 +121,6 @@ def _format_row(example: dict[str, Any], answer_format: str = "boxed") -> dict[s
     return {
         "datasource": "geo3k_imgurl_processed",
         "prompt": [{"role": "user", "content": user_text}],
-        "tools": [GEO3K_TOOL_SCHEMA],
-        "reward_model": {"ground_truth": answer, "style": "rule"},
         "response": [{"role": "assistant", "content": RESPONSE_WRAPPERS[answer_format].format(answer)}],
         "images": [image] if image is not None else [],
     }
@@ -209,10 +154,9 @@ def main():
     parser.add_argument("--num-proc", type=int, default=8)
     parser.add_argument(
         "--answer-format",
-        choices=sorted(ANSWER_WRAPPERS),
+        choices=sorted(RESPONSE_WRAPPERS),
         default="boxed",
-        help="Wrapper the model is asked to emit: 'boxed' (Qwen / DeepSeek-Math) "
-        "or 'answer' (<answer>...</answer>, Nemotron Omni). Grader accepts both.",
+        help="SFT target wrapper: 'boxed' (Qwen / DeepSeek-Math) or 'answer' (Nemotron Omni).",
     )
     args = parser.parse_args()
 

@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 from pathlib import Path
 
+from PIL import Image
+
 from polar.gateway.completion_writer import CompletionWriter, _truncate_value
+from polar.gateway.session import SessionRegistry
+from polar.gateway.storage import SessionStore
+from polar.rollout.models import SessionResult
+from polar.trajectory.models import Trajectory
 
 
 def test_truncate_value_string() -> None:
@@ -64,3 +72,55 @@ def test_writer_requires_task_id(tmp_path: Path) -> None:
         return ok
 
     assert asyncio.run(run()) is False
+
+
+def test_session_store_moves_media_out_of_completion_payload(tmp_path: Path) -> None:
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), "yellow").save(image_buffer, format="PNG")
+    image_url = "data:image/png;base64," + base64.b64encode(image_buffer.getvalue()).decode()
+    response = {
+        "prompt_token_ids": [1, 2],
+        "choices": [
+            {
+                "token_ids": [3, 4],
+                "logprobs": {"content": [{"token_id": 3, "logprob": -0.1}, {"token_id": 4, "logprob": -0.2}]},
+            }
+        ],
+    }
+    store = SessionStore(artifact_root=tmp_path)
+
+    request = {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": image_url}}]}]}
+    store.save_message(
+        "session-1",
+        request,
+        response,
+        task_id="task-1",
+    )
+    store.save_message("session-1", request, response, task_id="task-1")
+    record, repeated = store.load_completion_session("session-1").completions
+
+    assert len(record.media_paths) == 1 and Path(record.media_paths[0]).read_bytes() == image_buffer.getvalue()
+    assert repeated.media_paths == record.media_paths
+    assert len(list((tmp_path / "task_task-1" / "sessions" / "session-1" / "artifacts").glob("media-*"))) == 1
+    assert record.request["messages"][0]["content"][0]["image_url"]["url"].startswith("file://")
+    assert image_url not in record.model_dump_json()
+
+
+def test_delivered_gateway_result_releases_trajectory_payload() -> None:
+    registry = SessionRegistry()
+    registry.register("session-1", task_id="task-1")
+    registry.set_result(
+        "session-1",
+        SessionResult(
+            session_id="session-1",
+            task_id="task-1",
+            status="COMPLETED",
+            trajectory=Trajectory(status="COMPLETED"),
+        ),
+    )
+
+    registry.clear_result_payload("session-1")
+
+    info = registry.get("session-1")
+    assert info.status == "COMPLETED"
+    assert info.result is None

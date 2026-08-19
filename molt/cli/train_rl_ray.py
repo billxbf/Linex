@@ -39,10 +39,19 @@ def _ray_runtime_env_vars():
         "HF_HOME",
         "HF_HUB_CACHE",
         "HUGGINGFACE_HUB_CACHE",
+        "NCCL_IB_DISABLE",
+        "NCCL_CUMEM_ENABLE",
+        "NCCL_MNNVL_ENABLE",
+        "NCCL_NVLS_ENABLE",
+        "NCCL_P2P_DISABLE",
+        "NCCL_SHM_DISABLE",
+        "NCCL_SOCKET_IFNAME",
         "TRANSFORMERS_CACHE",
         "TORCH_COMPILE_DISABLE",
         "PYTORCH_CUDA_ALLOC_CONF",
         "VLLM_WORKER_MULTIPROC_METHOD",
+        "VLLM_ALLREDUCE_USE_SYMM_MEM",
+        "VLLM_USE_NCCL_SYMM_MEM",
         "WANDB_API_KEY",
         "WANDB_ENTITY",
         "WANDB_MODE",
@@ -101,6 +110,7 @@ def train(args):
             mamba_ssm_cache_dtype=args.vllm.mamba_ssm_cache_dtype,
             distributed_executor_backend=args.vllm.distributed_executor_backend,
             enable_expert_parallel=args.vllm.enable_expert_parallel,
+            moe_backend=args.vllm.moe_backend,
             disable_custom_all_reduce=args.vllm.disable_custom_all_reduce,
             enable_prefix_caching=args.vllm.enable_prefix_caching,
             enable_chunked_prefill=args.vllm.enable_chunked_prefill,
@@ -110,7 +120,6 @@ def train(args):
             dtype=args.vllm.dtype,
             block_size=args.vllm.block_size,
             mtp_num_speculative_tokens=args.vllm.mtp_num_speculative_tokens,
-            enable_return_routed_experts=args.train.routing_replay,
             pipeline_parallel_size=getattr(args.vllm, "pipeline_parallel_size", 1),
             data_parallel_size=getattr(args.vllm, "data_parallel_size", 1),
         )
@@ -156,61 +165,60 @@ def train(args):
 
     atexit.register(close_rollout_services)
 
-    if not args.train.agent_path:
-        from molt.trainer.rollout.polar import PolarServiceActor
-        from polar.config import TopologyConfig
+    from molt.trainer.rollout.polar import PolarServiceActor
+    from polar.config import TopologyConfig
 
-        try:
-            for index in range(args.rollout.gateway_count):
-                polar_gateways.append(
-                    PolarServiceActor.options(scheduling_strategy="SPREAD").remote("gateway", f"gateway-{index}")
-                )
-            gateway_nodes = ray.get([gateway.descriptor.remote() for gateway in polar_gateways])
-            polar_rollout = PolarServiceActor.remote("rollout")
-            rollout_node = ray.get(polar_rollout.descriptor.remote())
-            topology = TopologyConfig.model_validate(
-                {
-                    "rollout": {
-                        "host": rollout_node["host"],
-                        "port": rollout_node["port"],
-                        "public_url": rollout_node["url"],
-                        "save_dir": str(Path(args.rollout.save_dir).resolve()),
-                    },
-                    "gateway": {
-                        "rollout_server_url": rollout_node["url"],
-                        "nodes": [
-                            {
-                                "id": node["node_id"],
-                                "host": node["host"],
-                                "port": node["port"],
-                                "public_url": node["url"],
-                                "model_served": "policy",
-                                "inference": {"base_url": router_url},
-                                "max_init_workers": args.rollout.gateway_concurrency,
-                                "max_run_workers": args.rollout.gateway_concurrency,
-                                "max_postrun_workers": 2 * args.rollout.gateway_concurrency,
-                            }
-                            for node in gateway_nodes
-                        ],
-                    },
-                }
+    try:
+        for index in range(args.rollout.gateway_count):
+            polar_gateways.append(
+                PolarServiceActor.options(scheduling_strategy="SPREAD").remote("gateway", f"gateway-{index}")
             )
-            save_dir = Path(args.rollout.save_dir).resolve()
-            save_dir.mkdir(parents=True, exist_ok=True)
-            topology_path = save_dir / "topology.json"
-            topology_path.write_text(topology.model_dump_json(indent=2, exclude={"path"}) + "\n")
-            topology_payload = topology.model_dump(mode="json", exclude={"path"})
-            ray.get(polar_rollout.start.remote(topology_payload))
-            ray.get([gateway.start.remote(topology_payload) for gateway in polar_gateways])
-            ray.get(polar_rollout.ready.remote(len(polar_gateways)))
-        except Exception:
-            close_rollout_services()
-            raise
-        print(
-            f"[rollout] Polar ready at {rollout_node['url']} with {len(polar_gateways)} gateways; "
-            f"topology saved to {topology_path}",
-            flush=True,
+        gateway_nodes = ray.get([gateway.descriptor.remote() for gateway in polar_gateways])
+        polar_rollout = PolarServiceActor.remote("rollout")
+        rollout_node = ray.get(polar_rollout.descriptor.remote())
+        topology = TopologyConfig.model_validate(
+            {
+                "rollout": {
+                    "host": rollout_node["host"],
+                    "port": rollout_node["port"],
+                    "public_url": rollout_node["url"],
+                    "save_dir": str(Path(args.rollout.save_dir).resolve()),
+                },
+                "gateway": {
+                    "rollout_server_url": rollout_node["url"],
+                    "nodes": [
+                        {
+                            "id": node["node_id"],
+                            "host": node["host"],
+                            "port": node["port"],
+                            "public_url": node["url"],
+                            "model_served": "policy",
+                            "inference": {"base_url": router_url},
+                            "max_init_workers": args.rollout.gateway_concurrency,
+                            "max_run_workers": args.rollout.gateway_concurrency,
+                            "max_postrun_workers": 2 * args.rollout.gateway_concurrency,
+                        }
+                        for node in gateway_nodes
+                    ],
+                },
+            }
         )
+        save_dir = Path(args.rollout.save_dir).resolve()
+        save_dir.mkdir(parents=True, exist_ok=True)
+        topology_path = save_dir / "topology.json"
+        topology_path.write_text(topology.model_dump_json(indent=2, exclude={"path"}) + "\n")
+        topology_payload = topology.model_dump(mode="json", exclude={"path"})
+        ray.get(polar_rollout.start.remote(topology_payload))
+        ray.get([gateway.start.remote(topology_payload) for gateway in polar_gateways])
+        ray.get(polar_rollout.ready.remote(len(polar_gateways)))
+    except Exception:
+        close_rollout_services()
+        raise
+    print(
+        f"[rollout] Polar ready at {rollout_node['url']} with {len(polar_gateways)} gateways; "
+        f"topology saved to {topology_path}",
+        flush=True,
+    )
 
     from molt.trainer.rl_trainer import RLTrainer
 
@@ -234,7 +242,6 @@ def train(args):
             None,
             None,
             vllm_engines,
-            router_url=router_url,
             polar_rollout=polar_rollout,
             polar_gateways=polar_gateways,
             **gen_kwargs,
@@ -339,7 +346,6 @@ def train(args):
         ref_model,
         vllm_engines,
         critic_model_group=critic_model,
-        router_url=router_url,
         polar_rollout=polar_rollout,
         polar_gateways=polar_gateways,
         **gen_kwargs,
@@ -442,15 +448,14 @@ if __name__ == "__main__":
         "--actor.freeze_moe_router",
         action="store_true",
         default=False,
-        help="Freeze the MoE router/gate weights so routing is held fixed during training, which "
-        "stabilizes MoE training and keeps the vLLM-vs-actor routing identical.",
+        help="Freeze the MoE router/gate weights to stabilize MoE training.",
     )
     parser.add_argument(
         "--ref.model_name_or_path",
         type=str,
         default=None,
         help="Reference/teacher checkpoint. Defaults to the actor checkpoint (standard KL-to-init RL). "
-        "Set to a different (e.g. larger, same-tokenizer) model for on-policy distillation.",
+        "Set to a different checkpoint when KL should use another reference policy.",
     )
     # Critic (PPO value model; used only when --algo.advantage.estimator gae). It is
     # colocated in the actor workers and reuses the actor's optimizer/parallelism config.
@@ -497,34 +502,11 @@ if __name__ == "__main__":
     parser.add_argument("--data.max_len", type=int, default=2048, help="Max total sequence length (prompt + response)")
     parser.add_argument("--data.input_key", type=str, default="input", help="JSON dataset key")
     parser.add_argument(
-        "--data.label_key",
-        type=str,
-        default=None,
-        help="Dataset column holding the ground-truth answer/label used for reward scoring.",
-    )
-    parser.add_argument(
-        "--data.tools_key",
-        type=str,
-        default=None,
-        help="Dataset key whose value is a list of OpenAI function-call schemas; rendered "
-        "into the chat template (see Qwen `tools=`) so the model is taught the native "
-        "<tool_call>{...}</tool_call> emission format without manual prompt engineering.",
-    )
-    parser.add_argument(
         "--data.task_key",
         type=str,
         default="task",
         help="Dataset column containing a complete Polar task specification for that row.",
     )
-    parser.add_argument(
-        "--data.apply_chat_template",
-        action="store_true",
-        default=False,
-        help="Dataset rows are chat messages. Step runners render them here with the HF chat "
-        "template; chat agents require this flag and hand the raw messages to the chat server, "
-        "which renders them once with the model's own template.",
-    )
-    parser.add_argument("--data.image_key", type=str, default="images", help="Dataset key for image paths/URLs")
     parser.add_argument(
         "--data.max_images_per_prompt", type=int, default=0, help="Max images per prompt for vLLM (0 = text-only)"
     )
@@ -540,10 +522,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--algo.advantage.estimator",
         type=str,
-        choices=["reinforce", "rloo", "reinforce_baseline", "grpo", "dr_grpo", "on_policy_distill", "gae"],
+        choices=["reinforce", "rloo", "reinforce_baseline", "grpo", "dr_grpo", "gae"],
         default="reinforce",
-        help="Advantage estimation method: reinforce, rloo, reinforce_baseline, grpo, dr_grpo, "
-        "on_policy_distill (per-token reverse KL to the --ref.model_name_or_path teacher), or gae "
+        help="Advantage estimation method: reinforce, rloo, reinforce_baseline, grpo, dr_grpo, or gae "
         "(PPO value baseline — builds a colocated critic; see --critic.*)",
     )
     parser.add_argument("--algo.advantage.gamma", type=float, default=1, help="discount factor")
@@ -603,7 +584,7 @@ if __name__ == "__main__":
         "--algo.kl.init_coef",
         type=float,
         default=None,
-        help="KL coefficient. Defaults to 0.01 (KL-to-init RL) or 1.0 (on_policy_distill reverse-KL reward).",
+        help="KL-to-reference coefficient (default 0.01).",
     )
     parser.add_argument(
         "--algo.kl.target",
@@ -661,7 +642,6 @@ if __name__ == "__main__":
     parser.add_argument("--reward.clip_range", type=float, nargs=2, default=(-10, 10), help="Reward clip range")
 
     # Rollout / generation
-    parser.add_argument("--train.agent_path", type=str, default=None, help="Agent script path")
     parser.add_argument(
         "--rollout.task_spec",
         type=str,
@@ -783,6 +763,12 @@ if __name__ == "__main__":
         help="Enable vLLM TP+EP hybrid: experts EP-sharded across the TP ranks (Qwen3.5/3.6 MoE).",
     )
     parser.add_argument(
+        "--vllm.moe_backend",
+        type=str,
+        default=None,
+        help="Optional vLLM MoE kernel backend (for example triton); unset keeps vLLM auto-selection.",
+    )
+    parser.add_argument(
         "--vllm.disable_custom_all_reduce",
         action="store_true",
         default=False,
@@ -856,13 +842,7 @@ if __name__ == "__main__":
         "--rollout.save_dir",
         type=str,
         default="./rollout_results",
-        help="Directory for Polar results and the generated runtime topology",
-    )
-    parser.add_argument(
-        "--rollout.num_runners",
-        type=int,
-        default=2,
-        help="Frozen R3/VLM path: number of legacy runner actors",
+        help="Shared directory for Polar artifacts, results, and the generated runtime topology",
     )
     parser.add_argument(
         "--rollout.vllm_generate_batch_size", type=int, default=None, help="Batch size for vLLM generating samples"
@@ -943,14 +923,6 @@ if __name__ == "__main__":
         "1-step-stale rollout that inflates vllm_kl on routing-sensitive MoE checkpoints, at the "
         "cost of the generate/train overlap.",
     )
-    parser.add_argument(
-        "--train.routing_replay",
-        action="store_true",
-        default=False,
-        help="R3: capture the rollout router's per-token expert selection (vLLM) and replay it in "
-        "the training forward (AutoModel RouterReplay) so MoE training/rollout routing match. "
-        "MoE models only; incompatible with --train.partial_rollout_enable (preemption drops routing).",
-    )
     # Debug / repro: dump a rollout batch and replay it train-only (skip generation) to
     # iterate on the training+refit path in isolation; check_weight_update_equal checks every broadcast.
     parser.add_argument(
@@ -1029,9 +1001,7 @@ if __name__ == "__main__":
     resolve_ckpt_retention(args.ckpt)
 
     # ============================ Validate / derive arguments ============================
-    # NOTE: ordering matters where a check derives state a later check reads — the
-    # on_policy_distill branch fills in agent_path / kl.* before they are validated,
-    # and the VLM branch flips fsdp.packing_samples before the FSDP checks read it.
+    # NOTE: ordering matters where a check derives state a later check reads.
 
     # --- Required inputs ---
     if not args.actor.model_name_or_path:
@@ -1060,65 +1030,18 @@ if __name__ == "__main__":
         # --actor.eps_clip_low_high explicitly, so this is just the bare-CLI default.
         args.actor.eps_clip_low_high = (0.2, 0.2)
 
-    if args.algo.advantage.estimator == "on_policy_distill":
-        # On-policy distillation is a single switch. The reference model IS the teacher and the
-        # per-token reverse KL to it is the whole training signal, so the rest is derived here —
-        # no flags needed beyond --ref.model_name_or_path (and optional --algo.kl.init_coef).
-        if not args.ref.model_name_or_path:
-            raise ValueError("on_policy_distill requires --ref.model_name_or_path (the teacher checkpoint).")
-        args.algo.kl.estimator = "k1"  # ctx.kls = log pi_student - log pi_teacher (the reverse-KL reward)
-        args.algo.kl.use_loss = False  # KL flows through the advantage, not a separate loss term
-        if args.algo.kl.init_coef is None:
-            args.algo.kl.init_coef = 1.0  # pull onto the teacher at unit scale
-        if not args.train.agent_path:
-            # Distillation needs no task agent — default to the built-in generator (which just
-            # samples one on-policy completion per prompt, VLM-aware). Override for multi-turn.
-            from molt.agents import distill_agent
-
-            args.train.agent_path = distill_agent.__file__
-
-    # Standard KL-to-init RL default (on_policy_distill set its own coefficient above).
     if args.algo.kl.init_coef is None:
         args.algo.kl.init_coef = 0.01
 
     # --- Agent / rollout ---
-    legacy_rollout = (
-        args.train.routing_replay
-        or args.data.max_images_per_prompt > 0
-        or args.algo.advantage.estimator == "on_policy_distill"
-    )
-    if args.rollout.task_spec:
-        if args.train.routing_replay:
-            raise NotImplementedError("R3 routing replay through Polar is deferred.")
-        if args.data.max_images_per_prompt > 0:
-            raise NotImplementedError("VLM rollout through Polar is deferred; use a text-only task specification.")
-        if args.algo.advantage.estimator == "on_policy_distill":
-            raise NotImplementedError("Container-based on-policy distillation through Polar is deferred.")
-        if args.train.agent_path:
-            raise ValueError("Use --rollout.task_spec for Polar rollout; do not also set --train.agent_path.")
-    elif args.train.agent_path:
-        if not legacy_rollout:
-            raise ValueError(
-                "Direct text-agent rollout is no longer supported; configure --rollout.task_spec for Polar."
-            )
-    elif args.train.routing_replay:
-        raise NotImplementedError("R3 rollout through Polar is deferred; the frozen path requires --train.agent_path.")
-    elif args.data.max_images_per_prompt > 0:
-        raise NotImplementedError(
-            "VLM rollout through Polar is deferred; the frozen path requires --train.agent_path."
-        )
-
-    if not args.train.agent_path:
-        if args.data.apply_chat_template:
-            raise ValueError("Polar datasets supply plain task instructions; remove --data.apply_chat_template.")
-        if not args.vllm.tool_call_parser:
-            raise ValueError("Polar rollout requires --vllm.tool_call_parser (for example qwen3_coder).")
-        if args.vllm.router_policy != "consistent_hash":
-            raise ValueError("Polar rollout requires --vllm.router_policy consistent_hash for session affinity.")
-        if args.rollout.gateway_count <= 0 or args.rollout.gateway_concurrency <= 0:
-            raise ValueError("Polar gateway count and concurrency must both be positive.")
-        if args.rollout.session_timeout <= 0:
-            raise ValueError("--rollout.session_timeout must be positive.")
+    if not args.vllm.tool_call_parser:
+        raise ValueError("Polar rollout requires --vllm.tool_call_parser (for example qwen3_coder).")
+    if args.vllm.router_policy != "consistent_hash":
+        raise ValueError("Polar rollout requires --vllm.router_policy consistent_hash for session affinity.")
+    if args.rollout.gateway_count <= 0 or args.rollout.gateway_concurrency <= 0:
+        raise ValueError("Polar gateway count and concurrency must both be positive.")
+    if args.rollout.session_timeout <= 0:
+        raise ValueError("--rollout.session_timeout must be positive.")
 
     # Set vLLM generate_batch_size to rollout_batch_size if not specified
     if not args.rollout.vllm_generate_batch_size:
@@ -1187,24 +1110,6 @@ if __name__ == "__main__":
     if args.fsdp.pp_size > 1:
         raise NotImplementedError("Molt trainers are not pipeline-parallel aware yet; set --fsdp.pp_size 1")
 
-    if args.train.routing_replay and args.train.partial_rollout_enable:
-        # vLLM frees a request's captured routing on preemption, and partial
-        # rollout preempts in-flight requests at every weight sync -> the routing
-        # for those tokens would be lost. Keep partial rollout off under R3.
-        raise ValueError("--train.routing_replay is incompatible with --train.partial_rollout_enable.")
-
-    if args.train.routing_replay and args.vllm.mtp_num_speculative_tokens > 0:
-        # The engine's routed-experts capture misaligns under speculative decoding:
-        # replaying those rows routes the training forward WRONG, so R3 raises
-        # vllm_kl several-fold instead of lowering it (and the seq-mask-tis band
-        # then drops the affected data). Refuse the combination until the engine
-        # capture is spec-decode aware.
-        raise ValueError(
-            "--vllm.mtp_num_speculative_tokens is incompatible with --train.routing_replay: "
-            "the rollout engine's routed-experts capture misaligns under speculative "
-            "decoding. Disable MTP or run without routing replay."
-        )
-
     if args.vllm.enable_prefix_caching and args.vllm.mtp_num_speculative_tokens > 0:
         # Isolation-tested: each feature alone is logprob-clean, together they
         # inflate vllm_kl ~10x (spec-decode KV rollback vs cached-block reuse),
@@ -1215,20 +1120,6 @@ if __name__ == "__main__":
             "speculative decoding corrupts rollout logprobs when prefix-cached blocks are "
             "reused. Enable at most one of the two."
         )
-
-    if args.train.routing_replay:
-        # Fail in seconds (not 2+ min into vLLM/model init) if the runtime's AutoModel
-        # predates Rollout Routing Replay (PR #2797). The vLLM side only needs
-        # enable_return_routed_experts; the training side needs this module + the Gate hooks.
-        try:
-            import nemo_automodel.components.moe.router_replay  # noqa: F401
-        except ImportError as exc:
-            raise RuntimeError(
-                "--train.routing_replay needs AutoModel Rollout Routing Replay "
-                "(nemo_automodel.components.moe.router_replay, PR #2797). The installed nemo_automodel "
-                "predates it — rebuild the container with nemo-automodel >= 98e772cf0 (the requirements.txt "
-                "pin already includes it)."
-            ) from exc
 
     if args.fsdp.packing_samples:
         assert args.vllm.num_engines > 0, "Only support `--fsdp.packing_samples` with vLLM."

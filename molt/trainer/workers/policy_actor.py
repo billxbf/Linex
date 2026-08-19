@@ -390,8 +390,6 @@ class PolicyTrainer:
             # entropy_coef=0.0 disables the entropy term in loss. Skip the
             # entropy forward path entirely in that case.
             return_entropy=bool(self.args.actor.entropy_coef),
-            # R3: replay the rollout's expert selection (None when routing replay off).
-            routed_experts=experience.routed_experts,
             **multimodal_inputs,
         )
         action_log_probs = model_output["action_log_probs"]
@@ -399,9 +397,6 @@ class PolicyTrainer:
             # force_on_policy: experience_maker skipped the redundant old-logprob forward.
             # The batch is trained for one on-policy step, so old == this forward -> PPO
             # ratio 1 -> REINFORCE gradient; the IS correction still runs vs rollout_log_probs.
-            # Taking old FROM this forward also guarantees old and action share the exact
-            # R3-replayed routing (they are the same forward) — the importance ratio needs
-            # both log-probs computed under the rollout's expert selection.
             old_action_log_probs = action_log_probs.detach()
 
         # Debug observability: MOLT_DUMP_ROLLOUT_LOGPROBS=<path> dumps per-position
@@ -770,7 +765,6 @@ class PolicyModelActor(BaseModelActor):
             freeze_visual_encoder=getattr(strategy.args.actor, "freeze_visual_encoder", False),
             freeze_moe_router=getattr(strategy.args.actor, "freeze_moe_router", False),
             moe_aux_loss_coef=args.actor.aux_loss_coef,
-            routing_replay=getattr(args.train, "routing_replay", False),
         )
         if vllm_engines is not None:
             adapter = getattr(actor.model, "state_dict_adapter", None)
@@ -865,8 +859,8 @@ class PolicyModelActor(BaseModelActor):
 
     def forward(self, experience) -> torch.Tensor:
         """Old actor action log-probs for one rollout Experience — the old log-probs used off-policy
-        and the student side of the KL-as-reward path (on_policy_distill / reinforce-KL). reload()
-        first fetches the sample's heavy tensors (token ids / images / routing) from the producing
+        and the student side of the KL-as-reward path. reload()
+        first fetches the sample's heavy tensors (token ids / images) from the producing
         runner's shared-memory store — they reach this rank straight from the runner, never through
         the controller. Called per sample by execute_batch; the controller attaches the result as
         action_log_probs."""
@@ -878,15 +872,12 @@ class PolicyModelActor(BaseModelActor):
         if experience.mm_train_inputs and getattr(self.actor, "is_vlm", False):
             mm_inputs = merge_mm_train_inputs(experience.mm_train_inputs, device)
 
-        routed_experts = experience.routed_experts
         self.actor.eval()
         with torch.no_grad():
             output = self.actor(
                 experience.sequences.to(device),
                 experience.action_mask.to(device),
                 experience.attention_mask.to(device),
-                # R3: replay rollout routing so old picks the same experts as training.
-                routed_experts=routed_experts.to(device) if routed_experts is not None else None,
                 **mm_inputs,
             )
         self.actor.train()  # reset model state
@@ -899,7 +890,7 @@ class PolicyModelActor(BaseModelActor):
         return self.checkpoint_states
 
     def append(self, experience: Experience):
-        # reload() fetches the sample's heavy tensors (images / token ids / routing) from the
+        # reload() fetches the sample's heavy tensors (images / token ids) from the
         # producing runner's shared-memory store — they reach this rank straight from the runner,
         # never through the controller. A no-op for an already-local experience.
         self.trainer.replay_buffer.append(experience.reload())

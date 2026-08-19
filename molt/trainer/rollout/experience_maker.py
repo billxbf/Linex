@@ -96,7 +96,7 @@ class RemoteExperienceMaker:
 
         # Old actor log-probs. Force-on-policy with no KL reward (kl_coef==0): old == the training
         # forward, so the PPO ratio is 1 (REINFORCE) and policy_train recomputes old itself — skip
-        # the redundant pass. Otherwise (off-policy, or a KL/distill reward that compares old vs the
+        # the redundant pass. Otherwise (off-policy, or a KL reward that compares old vs the
         # ref) run the actor forward here.
         skip_actor_old = args.train.force_on_policy and args.algo.kl.init_coef == 0
         if not skip_actor_old:
@@ -104,8 +104,8 @@ class RemoteExperienceMaker:
 
         for i, experience in enumerate(experiences):
             experience.index = [i]
-            # KL-as-reward (on_policy_distill, or reinforce/gae with kl_coef>0 and KL kept off the
-            # loss): the advantage's per-token signal is the student->teacher KL. With KL in the loss
+            # With KL kept out of the loss, the advantage receives the per-token KL reward.
+            # With KL in the loss
             # (or no ref) the advantage sees no KL reward, so kl stays zero.
             if (
                 self.initial_model_group is not None
@@ -195,7 +195,7 @@ class RemoteExperienceMaker:
     def _per_sample_rewards(experiences: List[Experience]) -> dict:
         """No-merge path: every sample is its own rollout (one-element groups).
 
-        reinforce / gae / on_policy_distill score each sample independently, so a
+        reinforce / gae score each sample independently, so a
         multi-turn rollout split into several samples must NOT collapse to one reward
         (only the group baselines need that). Each sample keeps its own reward; the
         identity sample->row map leaves the per-sample broadcast unchanged.

@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import mimetypes
 import threading
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
+import httpx
 
 from polar.gateway.completion_writer import CompletionWriter
+from polar.gateway.transform.images import parse_data_url
 from polar.trajectory.models import CompletionRecord, CompletionSession
 
 
@@ -28,10 +37,16 @@ class _SessionState:
 class SessionStore:
     """Thread-safe in-memory storage for active gateway sessions."""
 
-    def __init__(self, *, completion_writer: CompletionWriter | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        completion_writer: CompletionWriter | None = None,
+        artifact_root: str | Path | None = None,
+    ) -> None:
         self._lock = threading.RLock()
         self._sessions: dict[str, _SessionState] = {}
         self._completion_writer = completion_writer
+        self._artifact_root = Path(artifact_root) if artifact_root else None
 
     def close(self) -> None:
         with self._lock:
@@ -39,10 +54,7 @@ class SessionStore:
 
     def list_active_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [
-                self._metadata_payload_locked(state)
-                for state in self._sessions.values()
-            ]
+            return [self._metadata_payload_locked(state) for state in self._sessions.values()]
 
     def get_completions(self, session_id: str) -> list[dict[str, Any]]:
         with self._lock:
@@ -91,13 +103,73 @@ class SessionStore:
     ) -> str:
         """Append one completion record to the in-memory session."""
         effective_model_used = model_used or request.get("model", "unknown")
+        completion_id = f"msg_{uuid.uuid4().hex[:12]}"
+        request = deepcopy(request)
+        response = deepcopy(response)
+        artifact_dir = None
+        media_paths: list[str] = []
+
+        # Store every image once per session and leave ordered path references in the record.
+        for message in request.get("messages") or []:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "image_url":
+                    continue
+                image_url = block.get("image_url")
+                url = (
+                    image_url
+                    if isinstance(image_url, str)
+                    else image_url.get("url")
+                    if isinstance(image_url, dict)
+                    else None
+                )
+                if not isinstance(url, str) or not url:
+                    continue
+                if self._artifact_root is None or not task_id:
+                    raise ValueError("VLM media require a shared rollout artifact root")
+
+                parsed = parse_data_url(url)
+                if parsed is not None:
+                    mime_type, encoded = parsed
+                    data = base64.b64decode(encoded)
+                    suffix = mimetypes.guess_extension(mime_type) or ".img"
+                elif url.startswith(("http://", "https://")):
+                    fetched = httpx.get(url, follow_redirects=True, timeout=30.0)
+                    fetched.raise_for_status()
+                    data = fetched.content
+                    suffix = (
+                        Path(urlparse(url).path).suffix
+                        or mimetypes.guess_extension(fetched.headers.get("content-type", "").partition(";")[0])
+                        or ".img"
+                    )
+                else:
+                    source = Path(urlparse(url).path if url.startswith("file://") else url)
+                    data = source.read_bytes()
+                    suffix = source.suffix or ".img"
+
+                if artifact_dir is None:
+                    artifact_dir = self._artifact_root / f"task_{task_id}" / "sessions" / session_id / "artifacts"
+                    artifact_dir.mkdir(parents=True, exist_ok=True)
+                path = artifact_dir / f"media-{hashlib.sha256(data).hexdigest()[:16]}{suffix}"
+                if not path.exists():
+                    path.write_bytes(data)
+                media_paths.append(str(path))
+                stored_url = path.resolve().as_uri()
+                if isinstance(image_url, str):
+                    block["image_url"] = stored_url
+                else:
+                    image_url["url"] = stored_url
+
         record = CompletionRecord.model_validate(
             {
-                "completion_id": f"msg_{uuid.uuid4().hex[:12]}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "completion_id": completion_id,
+                "timestamp": datetime.now(UTC).isoformat(),
                 "request": request,
-                "original_request": original_request or {},
+                "original_request": {} if media_paths else original_request or {},
                 "response": response,
+                "media_paths": media_paths,
                 "metadata": dict(metadata or {}),
             }
         )
@@ -130,7 +202,7 @@ class SessionStore:
                     "api_type": api_type,
                     "model_requested": model_requested,
                     "model_used": effective_model_used,
-                    "original_request": original_request or {},
+                    "original_request": {} if media_paths else original_request or {},
                     "transformed_request": request,
                     "response": response,
                     "metadata": dict(metadata or {}),
@@ -160,10 +232,7 @@ class SessionStore:
                 )
 
             payload = self._metadata_payload_locked(state)
-            payload["completions"] = [
-                completion.model_dump(mode="python")
-                for completion in state.completions
-            ]
+            payload["completions"] = [completion.model_dump(mode="python") for completion in state.completions]
             return CompletionSession.model_validate(payload)
 
     def delete_session(self, session_id: str) -> int:
@@ -184,13 +253,13 @@ class SessionStore:
         if state is None:
             state = _SessionState(
                 session_id=session_id,
-                created_at=created_at or datetime.now(timezone.utc).isoformat(),
+                created_at=created_at or datetime.now(UTC).isoformat(),
             )
             self._sessions[session_id] = state
             return state
 
         if state.created_at is None:
-            state.created_at = created_at or datetime.now(timezone.utc).isoformat()
+            state.created_at = created_at or datetime.now(UTC).isoformat()
         return state
 
     def _merge_metadata_locked(

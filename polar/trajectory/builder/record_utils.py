@@ -107,5 +107,6 @@ def build_trace_from_completion(completion: CompletionRecord) -> Trace:
         tools=_extract_tools(request),
         finish_reason=str(finish_reason) if finish_reason is not None else None,
         response_logprobs=response_logprobs,
+        media_paths=list(completion.media_paths),
         metadata=deepcopy(completion.metadata),
     )

@@ -147,7 +147,7 @@ class SFTDataset(Dataset):
         # image's placeholder run: pixel_values / image_grid_thw count every image
         # in full, so dropping placeholder tokens desyncs them and the model
         # forward crashes with a vit-embed shape mismatch. Collected from the
-        # processor (same attrs as vlm_utils.estimate_vllm_input_expansion_delta).
+        # processor.
         self.media_token_ids = set()
         unk_id = getattr(self.text_tokenizer, "unk_token_id", None)
         if self.processor is not None:

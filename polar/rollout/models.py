@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -80,7 +79,6 @@ class TaskRequest(BaseModel):
     builder: StrategySpec = Field(default_factory=_default_builder_spec)
     evaluator: EvaluatorSpec | None = None
     sampling_params: dict[str, object]
-    callback_url: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
@@ -145,25 +143,11 @@ class SessionResult(BaseModel):
 
 
 class TaskResult(BaseModel):
-    """Blocking response returned once all rollout sessions resolve."""
+    """Completed training task returned once all rollout sessions resolve."""
 
     task_id: str
     instruction: str
-    status: str  # Task-level status vocabulary: "running" | "completed" | "failed"
     results: list[SessionResult]
-    result_paths: list[str] = Field(default_factory=list)
-
-
-class TaskStatus(BaseModel):
-    """Monitoring view for a task that may still be running."""
-
-    task_id: str
-    instruction: str
-    status: str
-    total_sessions: int
-    completed_sessions: int
-    results: list[SessionResult] = Field(default_factory=list)
-    result_paths: list[str] = Field(default_factory=list)
 
 
 class NodeRegistrationRequest(BaseModel):
@@ -232,8 +216,3 @@ class SessionContext:
     node_id: str | None = None
     gateway_url: str | None = None
     timer: "StageTimer" = field(default_factory=_new_stage_timer)
-    rollout_result: SessionResult | None = None
-    completion_future: asyncio.Future[SessionResult] | None = field(
-        default=None,
-        repr=False,
-    )

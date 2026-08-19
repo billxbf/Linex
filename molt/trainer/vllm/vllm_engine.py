@@ -297,6 +297,7 @@ def create_vllm_engines(
     mamba_ssm_cache_dtype: Optional[str] = None,
     distributed_executor_backend: Optional[str] = None,
     enable_expert_parallel: bool = False,
+    moe_backend: Optional[str] = None,
     disable_custom_all_reduce: bool = False,
     # vLLM 0.21 EngineArgs accept None and resolve internally to its own default
     # (prefix_caching True, chunked_prefill True, async_scheduling True for
@@ -312,7 +313,6 @@ def create_vllm_engines(
     dtype: str = "bfloat16",
     block_size: Optional[int] = None,
     mtp_num_speculative_tokens: int = 0,
-    enable_return_routed_experts: bool = False,
     pipeline_parallel_size: int = 1,
     data_parallel_size: int = 1,
 ):
@@ -493,6 +493,9 @@ def create_vllm_engines(
             # ranks; MoE experts are EP-distributed across the same ranks (one group per rank).
             actor_kwargs["enable_expert_parallel"] = True
 
+        if moe_backend:
+            actor_kwargs["moe_backend"] = moe_backend
+
         if disable_custom_all_reduce:
             # Fall back from vLLM's custom all-reduce to NCCL for cross-GPU TP reductions.
             # The custom kernel needs supported GPU P2P / CUDA IPC, which can be unavailable
@@ -507,11 +510,6 @@ def create_vllm_engines(
             # subprocesses across this actor's TP*DP GPUs (single node).
             actor_kwargs["data_parallel_size"] = data_parallel_size
             actor_kwargs["data_parallel_backend"] = "mp"
-
-        if enable_return_routed_experts:
-            # R3: make vLLM return the router's per-token top-k expert ids so the
-            # training forward can replay the exact rollout routing (RouterReplay).
-            actor_kwargs["enable_return_routed_experts"] = True
 
         if logprobs_mode:
             # Don't cap max_logprobs: the RL path only requests logprobs=1, but

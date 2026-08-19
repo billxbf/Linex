@@ -151,66 +151,6 @@ def load_images(image_refs: Union[str, List[str], Image.Image, List[Any]]) -> Li
     return pil_images
 
 
-def estimate_vllm_input_expansion_delta(
-    processor,
-    token_ids: List[int],
-    mm_train_inputs: Optional[Dict],
-    pil_images: Optional[List[Image.Image]],
-) -> int:
-    """Estimate extra vLLM multimodal tokens beyond what's already in ``token_ids``.
-
-    Two processor patterns:
-      * **Per-grid expansion** (Qwen2.5-VL / Qwen3-VL): mm_train_inputs carries
-        ``image_grid_thw``. Each grid row ``[t, h, w]`` is in *patch* units, and
-        the spatial-merge kernel folds ``merge_size×merge_size`` patches into one
-        token, so the per-image token count is ``prod(grid) // merge_size**2``
-        (matches Automodel's ``image_grid_thw.prod(-1) // spatial_merge_size**2``
-        in qwen3_vl_moe and ``_estimate_media_tokens``). The delta is that token
-        count minus the media tokens already present in ``token_ids``.
-      * **Pre-expanded**: ``token_ids`` already contains the full per-vit-token
-        sequence. vLLM's dedup→re-expand round-trip is supposed to leave length
-        unchanged, but processor variance can add a handful of tokens — reserve
-        1024/image as a margin.
-    """
-    if not pil_images or not mm_train_inputs:
-        return 0
-
-    # Grid rows are in patch units; convert to token units with the processor's
-    # spatial-merge factor. Default to 1 (no division) when the processor does
-    # not expose ``merge_size`` — a best-effort estimate for unknown processors.
-    image_processor = getattr(processor, "image_processor", None)
-    merge_size = int(getattr(image_processor, "merge_size", 1) or 1)
-    merge_area = max(1, merge_size * merge_size)
-
-    grid_total = 0
-    for key in ("image_grid_thw", "video_grid_thw"):
-        raw = mm_train_inputs.get(key)
-        if raw is None:
-            continue
-        if not torch.is_tensor(raw):
-            try:
-                raw = torch.as_tensor(raw)
-            except Exception:
-                continue
-        if raw.numel() == 0 or raw.shape[-1] < 3:
-            continue
-        per_image_patches = raw.reshape(-1, raw.shape[-1])[..., -3:].long().prod(dim=-1)
-        grid_total += int((per_image_patches // merge_area).sum().item())
-
-    if grid_total == 0:
-        # Pre-expanded processor (no grid_thw): tokens already include vLLM's
-        # multimodal expansion. The vllm_engine still dedups + re-expands at
-        # generate-time (vllm_engine.py:145), and the round-trip variance can
-        # be hundreds of tokens for high-resolution ViT encoders. Use a
-        # 1024/image upper bound — safe for current generation VLMs without
-        # needing per-model tuning.
-        return 1024 * len(pil_images)
-
-    media_ids = media_token_ids(processor)
-    existing = sum(1 for tid in token_ids if int(tid) in media_ids) if media_ids else 0
-    return max(0, grid_total - existing)
-
-
 def process_prompt_with_images(
     processor, prompt: str, images: Any
 ) -> Tuple[List[int], Optional[Dict], List[Image.Image]]:
@@ -255,32 +195,6 @@ def process_prompt_with_images(
     _skip_keys = {"input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids"}
     mm_train_inputs = {k: v for k, v in proc_out.items() if k not in _skip_keys}
     return token_ids, (mm_train_inputs or None), pil_images
-
-
-def accumulate_mm_inputs(existing: Optional[Dict], new: Optional[Dict]) -> Optional[Dict]:
-    """Merge a new step's multimodal tensors into the running accumulator.
-
-    Keys present in only one dict are preserved; keys in both are concatenated
-    along dim=0.
-    """
-    if new is None:
-        return existing
-    if existing is None:
-        return {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in new.items()}
-    merged = {}
-    for k in set(existing) | set(new):
-        if k in existing and k in new:
-            a, b = existing[k], new[k]
-            # Variable-resolution pixel_values across agent steps (some VLM
-            # processors return 4D (N, C, H, W) with per-call H/W) — pad before cat.
-            if k == "pixel_values" and torch.is_tensor(a) and torch.is_tensor(b) and a.ndim == 4 and b.ndim == 4:
-                a, b = _pad_to_common_hw([a, b])
-            merged[k] = torch.cat([a, b], dim=0)
-        elif k in existing:
-            merged[k] = existing[k]
-        else:
-            merged[k] = new[k]
-    return merged
 
 
 def merge_mm_train_inputs(mm_train_inputs_list: list, device) -> Dict[str, torch.Tensor]:

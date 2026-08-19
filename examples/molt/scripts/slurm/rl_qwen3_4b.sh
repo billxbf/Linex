@@ -265,7 +265,6 @@ RL_ARGS=(
   --actor.model_name_or_path "$MODEL_PATH"
   --data.prompt_dataset "$PROMPT_DATASET"
   --data.input_key "${INPUT_KEY:-prompt}"
-  --data.image_key "${IMAGE_KEY:-images}"
   --data.max_samples "$MAX_SAMPLES"
   --data.max_len "$MAX_LENGTH"
   --rollout.batch_size "$ROLLOUT_BATCH_SIZE"

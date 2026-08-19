@@ -4,10 +4,13 @@
 import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
 from molt.cli.train_rl_ray import _ray_runtime_env_vars
+
+COUNT_STARS_TASK = Path(__file__).resolve().parents[2] / "examples" / "polar" / "count_stars" / "task.yaml"
 
 
 def _run_cli(*extra_args: str):
@@ -59,23 +62,42 @@ def test_corrected_partial_rollout_passes_cli_gate():
     assert "Per-token IS is correcting those off-policy tokens" in result.stdout
 
 
+def test_vlm_passes_the_polar_cli_gate():
+    result = _run_cli(
+        "--data.max_images_per_prompt",
+        "1",
+        "--rollout.task_spec",
+        str(COUNT_STARS_TASK),
+        "--vllm.moe_backend",
+        "triton",
+    )
+
+    assert result.returncode != 0
+    assert "pipeline-parallel" in result.stderr
+    assert "deferred" not in result.stderr
+
+
 @pytest.mark.parametrize(
-    ("extra_args", "message"),
+    "extra_args",
     [
-        (("--train.routing_replay",), "R3 rollout through Polar is deferred"),
-        (("--data.max_images_per_prompt", "1"), "VLM rollout through Polar is deferred"),
-        (("--train.agent_path", "unused"), "Direct text-agent rollout is no longer supported"),
+        ("--train.agent_path", "unused"),
+        ("--train.routing_replay",),
+        ("--algo.advantage.estimator", "on_policy_distill"),
     ],
 )
-def test_unsupported_rollout_configurations_fail_fast(extra_args, message):
+def test_removed_rollout_configuration_is_rejected(extra_args):
     result = _run_cli(*extra_args)
 
     assert result.returncode != 0
-    assert message in result.stderr
+    assert "unrecognized arguments" in result.stderr or "invalid choice" in result.stderr
 
 
 def test_ray_runtime_env_forwards_wandb_settings(monkeypatch):
     expected = {
+        "NCCL_CUMEM_ENABLE": "0",
+        "NCCL_P2P_DISABLE": "1",
+        "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
+        "VLLM_USE_NCCL_SYMM_MEM": "0",
         "WANDB_API_KEY": "test-api-key",
         "WANDB_ENTITY": "test-entity",
         "WANDB_MODE": "offline",

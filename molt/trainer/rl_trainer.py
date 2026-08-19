@@ -40,22 +40,8 @@ from molt.utils.utils import first_scalar, get_tokenizer
 logger = init_logger(__name__)
 
 
-def prepare_datasets(strategy, tokenizer):
+def prepare_datasets(strategy):
     args = strategy.args
-
-    # Polar consumes plain task instructions. Only the frozen legacy path loads
-    # a Molt runner to decide whether its chat messages are rendered here.
-    prerender = True
-    if getattr(args.train, "agent_path", None):
-        from molt.agents.base import load_agent_runner
-
-        prerender = getattr(load_agent_runner(args.train.agent_path), "PRERENDER_PROMPT", True)
-    if not prerender and not args.data.apply_chat_template:
-        raise ValueError(
-            "Chat agents consume the same chat-format dataset as step agents: pass "
-            "--data.apply_chat_template. The dataset hands the messages through raw; the chat "
-            "server renders them once with the model's own template."
-        )
 
     # prepare datasets
     train_data = blending_datasets(
@@ -69,7 +55,7 @@ def prepare_datasets(strategy, tokenizer):
 
     # Create train dataset
     train_data = train_data.select(range(min(args.data.max_samples, len(train_data))))
-    prompts_dataset = PromptDataset(train_data, tokenizer, strategy, prerender=prerender)
+    prompts_dataset = PromptDataset(train_data, strategy)
     prompts_dataloader = strategy.setup_dataloader(
         prompts_dataset,
         batch_size=1,
@@ -90,7 +76,7 @@ def prepare_datasets(strategy, tokenizer):
         # Eval uses the FULL eval set (no subsampling). --data.max_samples is the
         # TRAIN subsample knob; applying it here silently truncated eval too, so a
         # small --data.max_samples debug run distorted pass@k. Keep them decoupled.
-        eval_dataset = PromptDataset(eval_data, tokenizer, strategy, prerender=prerender)
+        eval_dataset = PromptDataset(eval_data, strategy)
         eval_dataloader = strategy.setup_dataloader(
             eval_dataset,
             batch_size=1,
@@ -152,26 +138,14 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
     """Compute pass@k eval metrics from generated samples.
 
     Robust to dropped rollouts: samples are grouped by their rollout ``group_id``
-    (falling back to the prompt string when group ids are absent) rather than a
-    rigid ``reshape(-1, n_samples_per_prompt)``. A rollout dropped during
-    generation (empty / zero-action / VLM-truncated — see
-    ``SamplesGenerator._process_response_into_experience``) only shrinks that
-    prompt's group instead of crashing the reshape or misaligning samples across
-    prompt boundaries.
+    instead of a rigid ``reshape(-1, n_samples_per_prompt)``.
     """
     if not samples_list:
         return {}
 
     prompt_to_datasource = {}
-    for datasources, prompts, _labels, _images, _tools, _task_specs in eval_dataloader:
+    for datasources, prompts, _task_specs in eval_dataloader:
         for prompt, datasource in zip(prompts, datasources):
-            if isinstance(prompt, list):
-                # Chat rows pass through as messages; key on the last user turn's text —
-                # the same scalar ChatAgentRunner stores as Trajectory.prompt.
-                texts = [
-                    m.get("content") for m in prompt if m.get("role") == "user" and isinstance(m.get("content"), str)
-                ]
-                prompt = texts[-1] if texts else str(prompt)
             prompt_to_datasource[prompt] = datasource
 
     # Each Experience here is a single rollout sample (B=1). Group the per-sample
@@ -311,8 +285,8 @@ class BaseRLTrainer:
         raise NotImplementedError("fit method is not implemented")
 
     def train_step(self, rollout_samples, global_step: int) -> Tuple[Dict, int]:
-        # `rollout_samples` are lazy Experiences: each sample's heavy tensors (images / token ids /
-        # rollout routing) sit in shared memory (the producing runner's object store) behind a handle.
+        # `rollout_samples` are lazy Experiences: each sample's model inputs sit in the
+        # generator actor's object store behind a handle.
         # The flow below is the ordinary single-controller RL step — balance, make experience, compute
         # advantages, push, optimize — and only the ranks that consume a sample fetch its heavy tensors
         # (Experience.reload()). So the controller works with light handles and a full image batch
@@ -371,8 +345,7 @@ class BaseRLTrainer:
 
         # Push the experiences to the actor shards (and the critic, which trains on the same batch
         # with values + returns) before optimization. Each rank fetches its samples' heavy tensors
-        # from the producing runner via reload() — the images reach the rank straight from the
-        # runner, never through the controller.
+        # from the generator actor via reload(), never through the controller.
         refs = self.actor_model_group.async_run_method_batch(method_name="append", experience=experiences)
         if self.critic_model_group is not None:
             refs += self.critic_model_group.async_run_method_batch(method_name="append", experience=experiences)
@@ -440,13 +413,12 @@ class BaseRLTrainer:
             status.update(result)
         # Fail loudly when the vLLM-IS filter dropped every sequence: the policy
         # gradient is exactly zero and the run silently optimizes nothing. The
-        # usual cause is rollout-vs-train forward mismatch, for MoE models most
-        # often unreplayed expert routing — enable --train.routing_replay.
+        # usual cause is rollout-vs-train forward mismatch.
         if status.get("is_filter_ratio", 0.0) >= 0.999:
             logger.warning(
                 f"is_filter_ratio={status['is_filter_ratio']:.3f}: the vLLM importance-sampling filter dropped "
                 f"(nearly) every sequence — zero policy gradient this step (vllm_kl={status.get('vllm_kl')}). "
-                "Rollout and training forwards disagree; for MoE models enable --train.routing_replay."
+                "Inspect model, tokenizer, sampling, and inference configuration."
             )
         if self.critic_model_group is not None:
             # Colocated actor and critic are separate processes sharing the same GPUs.
@@ -596,37 +568,23 @@ class GenerateSamplesActor:
         vllm_lock,
         rollout_queue,
         rollout_slots,
-        router_url=None,
-        polar_rollout=None,
+        polar_rollout,
         **generate_kwargs,
     ):
         # Only the TrainingActor touches vLLM engines directly for pause/refit/resume.
         self.args = strategy.args
+        if polar_rollout is None:
+            raise ValueError("Polar rollout actor is required")
 
         tokenizer = get_tokenizer(pretrain, None, "left", use_fast=not strategy.args.data.disable_fast_tokenizer)
-        self.prompts_dataloader, self.eval_dataloader, self.max_steps = prepare_datasets(strategy, tokenizer)
+        self.prompts_dataloader, self.eval_dataloader, self.max_steps = prepare_datasets(strategy)
         self.generate_kwargs = generate_kwargs
 
-        # Polar owns supported rollout sessions. Runner actors remain only for
-        # the frozen R3/VLM/distillation path.
-        agent_runners = None
-        if polar_rollout is None:
-            from molt.trainer.rollout.router import AgentRunnerActor
-
-            num_runners = max(1, getattr(strategy.args.rollout, "num_runners", 2))
-            agent_runners = [
-                AgentRunnerActor.options(scheduling_strategy="SPREAD").remote(
-                    strategy.args.train.agent_path, router_url, model_path=pretrain
-                )
-                for _ in range(num_runners)
-            ]
-            ray.get([runner.ready.remote() for runner in agent_runners])
         self.samples_generator = SamplesGenerator(
             strategy=strategy,
             prompts_dataloader=self.prompts_dataloader,
             eval_dataloader=self.eval_dataloader,
             tokenizer=tokenizer,
-            agent_runners=agent_runners,
             polar_rollout=polar_rollout,
             task_spec=getattr(strategy.args.rollout, "task", None),
         )
@@ -957,7 +915,6 @@ class RLTrainer:
         reference_model_group: RayActorGroup,
         vllm_engines,
         critic_model_group: RayActorGroup = None,
-        router_url: str | None = None,
         polar_rollout=None,
         polar_gateways=None,
         **generate_kwargs,
@@ -985,7 +942,6 @@ class RLTrainer:
             vllm_lock=vllm_lock,
             rollout_queue=self.rollout_queue,
             rollout_slots=self.rollout_slots,
-            router_url=router_url,
             polar_rollout=polar_rollout,
             **generate_kwargs,
         )

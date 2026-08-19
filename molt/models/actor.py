@@ -43,7 +43,6 @@ class Actor(BaseModel):
         position_ids: Optional[torch.Tensor] = None,
         cp_context_stack=None,
         return_entropy=False,
-        routed_experts: Optional[torch.Tensor] = None,
         **mm_inputs,
     ) -> _AttrDict:
         """Run the policy forward and return one named output dict.
@@ -58,7 +57,7 @@ class Actor(BaseModel):
         - ``aux_loss``:         MoE load-balancing loss — only for NeMo custom MoE.
         """
         output, rolled_sequences, cp_forward, indices, batch, seqlen = self._forward_backbone(
-            sequences, attention_mask, position_ids, cp_context_stack, mm_inputs, routed_experts=routed_experts
+            sequences, attention_mask, position_ids, cp_context_stack, mm_inputs
         )
         logits = output["logits"]
         full_logits = None

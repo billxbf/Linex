@@ -31,7 +31,7 @@ def _is_nightly():
 def _fetch_requirements(path):
     with open(path, "r") as fd:
         reqs = [r.strip() for r in fd.readlines()]
-    # Source/editable installs keep the exact git pins (R3 needs that AutoModel commit).
+    # Source/editable installs keep the exact git pins used by development.
     # PyPI rejects direct-URL requirements, so the PyPI build (python-package.yml sets
     # MOLT_PYPI_BUILD=1) swaps nemo-automodel to its release floor and drops dion (no PyPI dist).
     if os.getenv("MOLT_PYPI_BUILD") == "1":

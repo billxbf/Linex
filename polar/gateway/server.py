@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -88,7 +89,7 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
         queue_size=persistence_config.queue_size,
         enabled=persistence_config.enabled and bool(save_dir),
     )
-    storage = SessionStore(completion_writer=completion_writer)
+    storage = SessionStore(completion_writer=completion_writer, artifact_root=save_dir)
     transform_manager = TransformManager()
     session_registry = SessionRegistry()
     builder_registry = default_builder_registry()
@@ -581,7 +582,8 @@ async def _handle_non_streaming(
         logger.warning("Non-streaming upstream error for session %s: %s", session_id, exc)
         return _upstream_error_response(api_type, exc)
 
-    state.storage.save_message(
+    await asyncio.to_thread(
+        state.storage.save_message,
         session_id,
         openai_request,
         response,
@@ -620,7 +622,8 @@ async def _handle_streaming(
         logger.warning("Upstream error for streaming session %s: %s", session_id, exc)
         return _upstream_error_response(api_type, exc)
 
-    state.storage.save_message(
+    await asyncio.to_thread(
+        state.storage.save_message,
         session_id,
         openai_request,
         response,
