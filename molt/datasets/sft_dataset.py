@@ -218,12 +218,23 @@ class SFTDataset(Dataset):
         if images is not None and not isinstance(images, list):
             images = [images]
         if images is not None and len(images) > self.max_images_per_prompt:
-            return {"conversation": None, "images": None}  # dropped by .filter below
+            return {"conversation": None, "images": None, "tools": None}  # dropped by .filter below
 
         messages = self._to_messages(row)
         if messages is None:
-            return {"conversation": None, "images": None}
-        return {"conversation": json.dumps(messages), "images": images if self.image_key else None}
+            return {"conversation": None, "images": None, "tools": None}
+        tools = row.get("tools")
+        try:
+            tools = json.loads(tools) if isinstance(tools, str) else tools
+        except json.JSONDecodeError:
+            return {"conversation": None, "images": None, "tools": None}
+        if tools is not None and not isinstance(tools, list):
+            return {"conversation": None, "images": None, "tools": None}
+        return {
+            "conversation": json.dumps(messages),
+            "images": images if self.image_key else None,
+            "tools": json.dumps(tools) if tools is not None else None,
+        }
 
     def _to_messages(self, row) -> Optional[List[dict]]:
         """Assemble a [{role, content}, ...] conversation, or None to drop the row.
@@ -234,14 +245,33 @@ class SFTDataset(Dataset):
         """
         prompt = row[self.input_key]
         reply = row.get(self.output_key) if self.output_key else None
-        messages = list(prompt) if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
+        messages = [dict(m) for m in prompt] if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
         if isinstance(reply, list):
-            messages += reply
+            messages += [dict(m) for m in reply]
         elif isinstance(reply, dict):
-            messages.append(reply)
+            messages.append(dict(reply))
         elif reply is not None:
             messages.append({"role": "assistant", "content": reply})
-        if not any(m.get("role") == "assistant" for m in messages):
+        try:
+            for message in messages:
+                calls = message.get("tool_calls")
+                if not calls:
+                    continue
+                normalized = []
+                for call in calls:
+                    call = dict(call)
+                    function = dict(call["function"])
+                    arguments = function.get("arguments")
+                    arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+                    if not isinstance(arguments, dict):
+                        return None
+                    function["arguments"] = arguments
+                    call["function"] = function
+                    normalized.append(call)
+                message["tool_calls"] = normalized
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+        if not any(message.get("role") == "assistant" for message in messages):
             return None  # nothing to train on
         if self.expand_image_placeholder:
             messages = [split_image_placeholder(m) for m in messages]
@@ -259,7 +289,11 @@ class SFTDataset(Dataset):
         row = self.rows[idx]
         messages = json.loads(row["conversation"])
         images = row["images"] if self._has_images else None
-        text = self.text_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        tools = json.loads(row["tools"]) if row["tools"] is not None else None
+        template_kwargs = {"tools": tools} if tools is not None else {}
+        text = self.text_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False, **template_kwargs
+        )
         token_ids, mm_inputs = self._tokenize(text, images)
         loss_mask = self._loss_mask(token_ids)
         if not any(loss_mask):

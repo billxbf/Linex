@@ -72,12 +72,14 @@ class _FakeTok:
             i += len(sp) if sp else 1
         return out
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kwargs):
         assert not tokenize  # discover_reply_markers only renders to text
+        self.template_kwargs = kwargs
         return self.template(messages, add_generation_prompt)
 
-    def __call__(self, text, add_special_tokens=False):
-        return {"input_ids": [self._id(t) for t in self._split(text)]}
+    def __call__(self, text, add_special_tokens=False, truncation=False, max_length=None):
+        ids = [self._id(t) for t in self._split(text)]
+        return {"input_ids": ids[:max_length] if truncation and max_length else ids}
 
     def decode(self, ids):
         return "".join(self._id2tok[i] for i in ids)
@@ -203,3 +205,86 @@ def test_train_on_last_turn_only_keeps_final_reply():
     is_reply = [False] + [shifted[t] == 1.0 for t in range(len(ids) - 1)]
     supervised = tok.decode([ids[t] for t in range(len(ids)) if is_reply[t]])
     assert "last" in supervised and "first" not in supervised
+
+
+def test_skill2env_tools_and_arguments_reach_chat_template():
+    tok = _FakeTok(_chatml("none"))
+    ds = object.__new__(SFTDataset)
+    ds.input_key = "messages"
+    ds.output_key = None
+    ds.image_key = None
+    ds.max_images_per_prompt = 0
+    ds.expand_image_placeholder = False
+    ds.text_tokenizer = tok
+    ds.max_length = 128
+    ds._has_images = False
+    ds.reply_open, ds.reply_close, ds.supervise_close = discover_reply_markers(tok)
+    ds.train_on_last_turn_only = False
+    ds.rows = [
+        ds._build_row(
+            {
+                "messages": [
+                    {"role": "user", "content": "inspect"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'},
+                            }
+                        ],
+                    },
+                ],
+                "tools": '[{"type": "function", "function": {"name": "read_file"}}]',
+            }
+        )
+    ]
+
+    messages = __import__("json").loads(ds.rows[0]["conversation"])
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == {"path": "a.txt"}
+    ds[0]
+    assert tok.template_kwargs["tools"][0]["function"]["name"] == "read_file"
+
+
+def test_skill2env_malformed_tool_arguments_are_excluded():
+    ds = object.__new__(SFTDataset)
+    ds.input_key = "messages"
+    ds.output_key = None
+    ds.image_key = None
+    ds.max_images_per_prompt = 0
+    ds.expand_image_placeholder = False
+
+    row = ds._build_row(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "write", "arguments": '{"text": "truncated'}}],
+                }
+            ],
+            "tools": "[]",
+        }
+    )
+    assert row["conversation"] is None
+
+
+def test_tool_responses_are_context_not_targets():
+    tok = _FakeTok(_chatml("none"))
+    ds = object.__new__(SFTDataset)
+    ds.reply_open, ds.reply_close, ds.supervise_close = discover_reply_markers(tok)
+    ds.train_on_last_turn_only = False
+    conv = [
+        {"role": "user", "content": "inspect"},
+        {"role": "assistant", "content": "calling"},
+        {"role": "tool", "content": "secret tool output"},
+        {"role": "assistant", "content": "done"},
+    ]
+    ids = tok(tok.apply_chat_template(conv, tokenize=False, add_generation_prompt=False))["input_ids"]
+    shifted = ds._loss_mask(ids)
+    is_reply = [False] + [shifted[t] == 1.0 for t in range(len(ids) - 1)]
+    supervised = tok.decode([ids[t] for t in range(len(ids)) if is_reply[t]])
+    assert "calling" in supervised and "done" in supervised
+    assert "secret tool output" not in supervised
