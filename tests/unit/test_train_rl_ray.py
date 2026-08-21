@@ -77,6 +77,14 @@ def test_vlm_passes_the_polar_cli_gate():
     assert "deferred" not in result.stderr
 
 
+def test_dynamic_batching_does_not_require_sequence_packing():
+    result = _run_cli("--train.dynamic_batch_enable")
+
+    assert result.returncode != 0
+    assert "pipeline-parallel" in result.stderr
+    assert "requires packed training batches" not in result.stderr
+
+
 @pytest.mark.parametrize(
     "extra_args",
     [
@@ -185,3 +193,23 @@ def test_polar_gateways_wrap_vllm_weight_update(monkeypatch):
         "gateway_resume",
         "lock_release",
     ]
+
+
+def test_training_stops_at_computed_max_steps():
+    from molt.trainer import rl_trainer
+
+    metadata = getattr(rl_trainer.TrainingActor, "__ray_metadata__", None)
+    actor_class = metadata.modified_class if metadata else rl_trainer.TrainingActor
+    actor = object.__new__(actor_class)
+    payloads = iter([("samples", {}, {}, 0.0, 0.0), "done"])
+    actor.rollout_queue = types.SimpleNamespace(get=lambda **_kwargs: next(payloads))
+    released = []
+    actor.rollout_slots = types.SimpleNamespace(put=lambda value, **_kwargs: released.append(value))
+    actor.max_steps = 10
+    actor.wandb_logger = None
+    actor.tensorboard_logger = None
+    actor.train_step = lambda *_args: pytest.fail("surplus rollout was trained")
+
+    actor.fit(global_step=10)
+
+    assert released == [10]

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import copy
 import os
 import statistics
 import time
@@ -720,7 +721,8 @@ class GenerateSamplesActor:
                     if self.args.train.rollout_dump_dir and rollout_samples:
                         os.makedirs(self.args.train.rollout_dump_dir, exist_ok=True)
                         dump_path = os.path.join(self.args.train.rollout_dump_dir, f"rollout_step{global_step}.pt")
-                        torch.save(rollout_samples, dump_path)
+                        local_samples = [copy.copy(sample).reload() for sample in rollout_samples]
+                        torch.save(local_samples, dump_path)
                         logger.info(f"[rollout_dump] wrote {len(rollout_samples)} samples to {dump_path}")
 
                 if rollout_samples:
@@ -783,6 +785,7 @@ class TrainingActor(BaseRLTrainer):
         vllm_lock,
         rollout_queue,
         rollout_slots,
+        max_steps,
         polar_gateways=None,
         critic_model_group=None,
     ):
@@ -803,6 +806,7 @@ class TrainingActor(BaseRLTrainer):
         self.polar_gateways = polar_gateways or []
         self.rollout_queue = rollout_queue
         self.rollout_slots = rollout_slots
+        self.max_steps = max_steps
 
     def fit(self, global_step: int = 0) -> None:
         step_start_time = time.time()
@@ -829,6 +833,11 @@ class TrainingActor(BaseRLTrainer):
                 client_states["global_step"] = global_step
                 self.save_best_checkpoint(eval_metrics, eval_step, client_states)
                 step_start_time = time.time()
+                continue
+
+            # Async prefetch may enqueue beyond the scheduler's step count; drain it without optimizing.
+            if global_step >= self.max_steps:
+                self.rollout_slots.put(global_step, block=True)
                 continue
 
             rollout_samples, client_states, rollout_metrics, generation_time, vllm_idle_wait = payload
@@ -945,6 +954,8 @@ class RLTrainer:
             polar_rollout=polar_rollout,
             **generate_kwargs,
         )
+        max_steps = ray.get(self.generator_actor.get_max_steps.remote())
+        self.max_steps = max_steps
 
         # Eval-only runs pass actor_model_group=None: keep only the generator actor (vLLM + env) and
         # never build the training side, so no policy/ref/critic FSDP model is loaded.
@@ -959,6 +970,7 @@ class RLTrainer:
                 vllm_lock=vllm_lock,
                 rollout_queue=self.rollout_queue,
                 rollout_slots=self.rollout_slots,
+                max_steps=max_steps,
                 polar_gateways=polar_gateways,
                 critic_model_group=critic_model_group,
             )
@@ -975,6 +987,9 @@ class RLTrainer:
         start_episode = checkpoint_states.get("episode", 0)
         global_step = checkpoint_states.get("global_step", 0)
         total_consumed_prompts = checkpoint_states.get("total_consumed_prompts", 0)
+        if global_step >= self.max_steps:
+            ray.get(self.trainer_actor.broadcast_to_vllm.remote())
+            return
         if global_step > 0:
             ray.get(
                 [

@@ -88,6 +88,7 @@ def test_completion_uses_one_direct_request_with_molt_sampling() -> None:
     assert session_id == "session-1"
     assert payload["stream"] is False
     assert payload["max_tokens"] == 8
+    assert payload["truncate_prompt_tokens"] == 2
     assert payload["temperature"] == 0.2
     assert payload["top_p"] == 1.0
     assert payload["top_k"] == -1

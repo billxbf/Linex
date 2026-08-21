@@ -83,6 +83,7 @@ across a policy update.
 - [SWE-bench Verified](examples/polar/swebench_verified/README.md): per-instance runtime and evaluator rows.
 - [TMax-15K-Harbor](examples/polar/tmax-15k/README.md): terminal-agent tasks and Harbor rewards.
 - [Count Stars](examples/polar/count_stars/README.md): one-step VLM artifact smoke test.
+- [Skill2Env](examples/skill2env/README.md): Apptainer/Hermes RL acceptance and the existing SFT recipe.
 
 Text and VLM agent rollouts all run through Polar. Media stays in the shared run
 directory while task results carry only paths.

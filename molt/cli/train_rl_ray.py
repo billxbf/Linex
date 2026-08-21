@@ -880,7 +880,7 @@ if __name__ == "__main__":
         "--train.dynamic_batch_enable",
         action="store_true",
         default=False,
-        help="Group packed samples by token budget; reuses the loaded model's packed forward path.",
+        help="Group samples into dynamic microbatches by token budget.",
     )
     parser.add_argument(
         "--train.force_on_policy",
@@ -1131,11 +1131,6 @@ if __name__ == "__main__":
 
     # --- Training / rollout sizing ---
     if args.train.dynamic_batch_enable:
-        if not args.fsdp.packing_samples:
-            raise ValueError(
-                "--train.dynamic_batch_enable requires packed training batches; "
-                "pass --fsdp.packing_samples or disable dynamic batch."
-            )
         if args.rollout.max_tokens_per_gpu is None:
             print("[Warning] Set --rollout.max_tokens_per_gpu to --train.max_tokens_per_gpu.")
             args.rollout.max_tokens_per_gpu = args.train.max_tokens_per_gpu

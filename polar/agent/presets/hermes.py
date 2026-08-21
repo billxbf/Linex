@@ -6,12 +6,12 @@ import json
 import shlex
 
 from polar.agent.base import BaseHarness
-from polar.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR
+from polar.runtime.base import RUNTIME_AGENT_LOG_DIR, RUNTIME_SESSION_DIR, BaseRuntime
 from polar.runtime.models import ExecInput
 
 # Isolated agent home so Hermes' sessions/skills/memory stay out of the
 # workspace git diff. Read via the HERMES_HOME env var at run time.
-_HERMES_HOME = "/tmp/hermes"
+_HERMES_HOME = f"{RUNTIME_SESSION_DIR}/hermes"
 # A user-defined provider pins the OpenAI-compatible transport + gateway base
 # URL explicitly. Hermes' built-in providers and `provider: auto` route by
 # models.dev heuristics (and can mis-detect the model vendor), so we bypass them.
@@ -66,8 +66,8 @@ class HermesHarness(BaseHarness):
                     f"printf '%s' {shlex.quote(config_json)} "
                     f'| sed "s|{_BASE_URL_PLACEHOLDER}|$OPENAI_BASE_URL|g" '
                     f"> {_HERMES_HOME}/config.yaml && "
-                    'export PATH="$HOME/.local/bin:$PATH" && '
-                    f"hermes {flags_str} "
+                    'export PATH="$HOME/.local/node/bin:$HOME/.local/bin:$PATH" && '
+                    f"set -o pipefail && hermes {flags_str} "
                     f"2>&1 | tee {RUNTIME_AGENT_LOG_DIR}/hermes.txt"
                 ),
                 env={**self.env, "HERMES_HOME": _HERMES_HOME, "TERMINAL_ENV": "local"},

@@ -9,6 +9,7 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -94,6 +95,9 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
     session_registry = SessionRegistry()
     builder_registry = default_builder_registry()
     evaluator_registry = default_evaluator_registry()
+    session_base_dir = Path(save_dir) / "sessions" / node.id if save_dir else None
+    if session_base_dir is not None:
+        session_base_dir.mkdir(parents=True, exist_ok=True)
     node_manager = GatewayNodeManager(
         node_id=node.id,
         gateway_url=node.public_url,
@@ -105,6 +109,7 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
         builders=builder_registry,
         evaluators=evaluator_registry,
         default_runtime=node.default_runtime,
+        session_base_dir=str(session_base_dir) if session_base_dir else None,
         rollout_server_url=topology.gateway.rollout_server_url or None,
         heartbeat_interval_seconds=topology.gateway.heartbeat_interval_seconds,
     )

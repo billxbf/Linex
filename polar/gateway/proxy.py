@@ -126,6 +126,10 @@ class InferenceClient:
                 if name not in {"max_total_tokens", "skip_special_tokens", "include_stop_str_in_output"}
             }
         )
+        max_total_tokens = sampling_params.get("max_total_tokens")
+        max_tokens = sampling_params.get("max_tokens")
+        if isinstance(max_total_tokens, int) and isinstance(max_tokens, int) and max_total_tokens > max_tokens:
+            request_copy["truncate_prompt_tokens"] = max_total_tokens - max_tokens
         # vLLM gives this OpenAI alias precedence over max_tokens.
         request_copy.pop("max_completion_tokens", None)
         request_copy["stream"] = False
