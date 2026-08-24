@@ -84,6 +84,7 @@ class PiHarness(BaseHarness):
             ExecInput(
                 command=(
                     f"mkdir -p {self._AGENT_DIR} && "
+                    'export PATH="$HOME/.local/node/bin:$HOME/.local/bin:$PATH" && '
                     # $OPENAI_BASE_URL is substituted at exec time; the
                     # placeholder keeps the JSON static (no shell quoting fun).
                     f"printf '%s' {shlex.quote(config_json)} "

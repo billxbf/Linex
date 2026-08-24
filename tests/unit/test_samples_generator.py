@@ -162,7 +162,7 @@ def test_generate_eval_samples_uses_independent_eval_batch_size(monkeypatch):
     assert dispatch_sizes == [4, 1]
 
 
-def test_generate_eval_samples_defaults_to_rollout_batch_size(monkeypatch):
+def test_generate_eval_samples_defaults_to_rollout_batch_size_and_refills_each_slot(monkeypatch):
     generator = object.__new__(SamplesGenerator)
     generator.args = SimpleNamespace(
         rollout=SimpleNamespace(batch_size=2, n_samples_per_prompt=1),
@@ -174,7 +174,7 @@ def test_generate_eval_samples_defaults_to_rollout_batch_size(monkeypatch):
     samples = generator.generate_eval_samples()
 
     assert len(samples) == 5
-    assert dispatch_sizes == [2, 2, 1]
+    assert dispatch_sizes == [2, 1, 1, 1]
 
 
 def test_generate_samples_pool_persists_across_calls(monkeypatch):

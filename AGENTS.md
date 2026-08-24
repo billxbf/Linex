@@ -12,6 +12,13 @@ The only inference backend is vLLM router controlled by Molt's Ray.
 Duplicating arguments and data classes from both frameworks should merge into 
 one and get configured in one place. CLI entry should still reuse Molt existing ones.
 
+### Code Reference -- Molt and Polar
+
+The original upstream of Molt (reference/labs-molt) and Polar (reference/ProRL-Agent-Server)
+are cloned locally for read-only reference. Do not modify or treat them as dependency in 
+any way. They are put here to demonstrate the original implementation 
+of respective frameworks and to keep track of their latest changes.
+
 ## Code standards -- Simple and Elegant.
 
 The priority order is explicit: # Simplicity is the first principle
@@ -68,9 +75,9 @@ preferences. A violation is a bug and must be fixed before the change ships.
 - A "bug" that cannot trigger under the real recipes is not worth fixing.
 
 
-## Code Reference
-
-The original upstream of Molt (reference/labs-molt) and Polar (reference/ProRL-Agent-Server)
-are cloned locally for read-only reference. Do not modify or treat them as dependency in 
-any way. They are put here to demonstrate the original implementations 
-of respective frameworks and to keep track of their latest changes.
+## Agent Workflow (RFC --> Work Report)
+If an agent is asked to implement a RFC under `rfcs/`, make sure to log important
+challenges, caveat, experiment results, statistics, etc. When the implementation
+completes, render a clear and instructive work report as webpage, containing
+important data, visualization and include challenges and suggestions for the 
+next steps. Put the report under `reports/rfc-{index}-{rfc_name}/`.  

@@ -44,27 +44,27 @@ logger = init_logger(__name__)
 def prepare_datasets(strategy):
     args = strategy.args
 
-    # prepare datasets
-    train_data = blending_datasets(
-        args.data.prompt_dataset,
-        args.data.prompt_probs,
-        strategy,
-        args.train.seed,
-        max_count=args.data.max_samples,
-        dataset_split=args.data.prompt_split,
-    )
-
-    # Create train dataset
-    train_data = train_data.select(range(min(args.data.max_samples, len(train_data))))
-    prompts_dataset = PromptDataset(train_data, strategy)
-    prompts_dataloader = strategy.setup_dataloader(
-        prompts_dataset,
-        batch_size=1,
-        pin_memory=True,
-        shuffle=True,
-        collate_fn=prompts_dataset.collate_fn,
-        num_workers=args.data.dataloader_num_workers,
-    )
+    prompts_dataset = None
+    prompts_dataloader = None
+    if not getattr(args.eval, "eval_only", False):
+        train_data = blending_datasets(
+            args.data.prompt_dataset,
+            args.data.prompt_probs,
+            strategy,
+            args.train.seed,
+            max_count=args.data.max_samples,
+            dataset_split=args.data.prompt_split,
+        )
+        train_data = train_data.select(range(min(args.data.max_samples, len(train_data))))
+        prompts_dataset = PromptDataset(train_data, strategy)
+        prompts_dataloader = strategy.setup_dataloader(
+            prompts_dataset,
+            batch_size=1,
+            pin_memory=True,
+            shuffle=True,
+            collate_fn=prompts_dataset.collate_fn,
+            num_workers=args.data.dataloader_num_workers,
+        )
 
     # Create eval dataset if eval data exists
     if getattr(args.eval, "dataset", None):
@@ -89,7 +89,9 @@ def prepare_datasets(strategy):
     else:
         eval_dataloader = None
 
-    if args.train.force_on_policy:
+    if prompts_dataset is None:
+        max_steps = 0
+    elif args.train.force_on_policy:
         # On-policy: one optimizer step per rollout batch (per epoch), regardless
         # of how many samples multi-turn flatten produces. The generator consumes
         # rollout.batch_size prompt-groups per round, so the LR scheduler decays

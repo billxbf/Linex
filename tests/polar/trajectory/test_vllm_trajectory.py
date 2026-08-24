@@ -100,6 +100,42 @@ def test_prefix_merging_preserves_interstitial_tokens_and_logprobs() -> None:
     assert trace.response_logprobs == [-0.1, -0.2, -0.3, 0.0, 0.0, -0.5, -0.6, -0.7]
 
 
+def test_prefix_merging_tolerates_retokenized_final_prompt_token() -> None:
+    user = {"role": "user", "content": "Q1"}
+    records = [
+        _record(
+            "c1",
+            [1, 2, 198],
+            [10, _EOT],
+            [-0.1, -0.2],
+            content="A1",
+            prompt_messages=[user],
+        ),
+        _record(
+            "c2",
+            [1, 2, 271, 10, _EOT, 50],
+            [20, _EOT],
+            [-0.3, -0.4],
+            content="A2",
+            prompt_messages=[
+                user,
+                {"role": "assistant", "content": "A1"},
+                {"role": "tool", "content": "result"},
+            ],
+        ),
+    ]
+
+    trajectory = asyncio.run(
+        PrefixMergingBuilder(end_of_turn_token_id=_EOT).build(
+            CompletionSession(session_id="s", completions=records)
+        )
+    )
+
+    assert trajectory.metadata["trace_count"] == 1
+    assert trajectory.metadata["reconstruction_stats"]["completions_merged"] == 2
+    assert trajectory.traces[0].response_ids == [10, _EOT, 50, 20, _EOT]
+
+
 def test_prefix_merging_keeps_media_with_merged_tokens() -> None:
     records = [
         _record(

@@ -127,6 +127,47 @@ def test_ray_runtime_env_omits_empty_optional_settings(monkeypatch):
     assert not {"WANDB_API_KEY", "WANDB_ENTITY", "WANDB_MODE"} & env_vars.keys()
 
 
+def test_eval_only_prepares_only_the_eval_dataset(monkeypatch):
+    try:
+        import vllm  # noqa: F401
+    except ModuleNotFoundError:
+        vllm = types.ModuleType("vllm")
+        vllm.__version__ = "0.27.1"
+        vllm.AsyncEngineArgs = type("AsyncEngineArgs", (), {})
+        vllm.AsyncLLMEngine = type("AsyncLLMEngine", (), {})
+        monkeypatch.setitem(sys.modules, "vllm", vllm)
+    from molt.trainer import rl_trainer
+
+    loaded = []
+
+    def blending_datasets(name, *_args, **_kwargs):
+        loaded.append(name)
+        return ["eval row"]
+
+    eval_dataloader = object()
+    strategy = types.SimpleNamespace(
+        args=types.SimpleNamespace(
+            data=types.SimpleNamespace(dataloader_num_workers=0),
+            eval=types.SimpleNamespace(eval_only=True, dataset="eval.jsonl", split="train"),
+            train=types.SimpleNamespace(),
+        ),
+        setup_dataloader=lambda *_args, **_kwargs: eval_dataloader,
+    )
+    monkeypatch.setattr(rl_trainer, "blending_datasets", blending_datasets)
+    monkeypatch.setattr(
+        rl_trainer,
+        "PromptDataset",
+        lambda *_args, **_kwargs: types.SimpleNamespace(collate_fn=None),
+    )
+
+    prompts, evaluation, max_steps = rl_trainer.prepare_datasets(strategy)
+
+    assert loaded == ["eval.jsonl"]
+    assert prompts is None
+    assert evaluation is eval_dataloader
+    assert max_steps == 0
+
+
 def test_polar_gateways_wrap_vllm_weight_update(monkeypatch):
     try:
         import vllm

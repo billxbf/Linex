@@ -118,6 +118,8 @@ class SFTDataset(Dataset):
 
     Set ``train_on_last_turn_only`` to supervise only the final assistant turn
     (per-turn-flattened data, where earlier assistant turns are context).
+    When ``output_key`` is set, every message under ``input_key`` is context,
+    including assistant examples or harness preamble.
     """
 
     def __init__(
@@ -218,22 +220,27 @@ class SFTDataset(Dataset):
         if images is not None and not isinstance(images, list):
             images = [images]
         if images is not None and len(images) > self.max_images_per_prompt:
-            return {"conversation": None, "images": None, "tools": None}  # dropped by .filter below
+            return {"conversation": None, "images": None, "tools": None, "response_start": None}
 
         messages = self._to_messages(row)
         if messages is None:
-            return {"conversation": None, "images": None, "tools": None}
+            return {"conversation": None, "images": None, "tools": None, "response_start": None}
+        prompt = row[self.input_key]
+        response_start = (len(prompt) if isinstance(prompt, list) else 1) if self.output_key else 0
+        if not any(message.get("role") == "assistant" for message in messages[response_start:]):
+            return {"conversation": None, "images": None, "tools": None, "response_start": None}
         tools = row.get("tools")
         try:
             tools = json.loads(tools) if isinstance(tools, str) else tools
         except json.JSONDecodeError:
-            return {"conversation": None, "images": None, "tools": None}
+            return {"conversation": None, "images": None, "tools": None, "response_start": None}
         if tools is not None and not isinstance(tools, list):
-            return {"conversation": None, "images": None, "tools": None}
+            return {"conversation": None, "images": None, "tools": None, "response_start": None}
         return {
             "conversation": json.dumps(messages),
             "images": images if self.image_key else None,
             "tools": json.dumps(tools) if tools is not None else None,
+            "response_start": response_start,
         }
 
     def _to_messages(self, row) -> Optional[List[dict]]:
@@ -271,8 +278,6 @@ class SFTDataset(Dataset):
                 message["tool_calls"] = normalized
         except (json.JSONDecodeError, KeyError, TypeError):
             return None
-        if not any(message.get("role") == "assistant" for message in messages):
-            return None  # nothing to train on
         if self.expand_image_placeholder:
             messages = [split_image_placeholder(m) for m in messages]
         return messages
@@ -295,7 +300,8 @@ class SFTDataset(Dataset):
             messages, tokenize=False, add_generation_prompt=False, **template_kwargs
         )
         token_ids, mm_inputs = self._tokenize(text, images)
-        loss_mask = self._loss_mask(token_ids)
+        skip_replies = self._count_replies(messages[: row["response_start"]], template_kwargs)
+        loss_mask = self._loss_mask(token_ids, skip_replies=skip_replies)
         if not any(loss_mask):
             # No supervised tokens — the sample contributes zero loss. Most often
             # this is VLM over-length truncation in _tokenize keeping only the
@@ -339,11 +345,31 @@ class SFTDataset(Dataset):
         ]
         return token_ids, None
 
-    def _loss_mask(self, ids: List[int]) -> List[float]:
+    def _count_replies(self, messages: List[dict], template_kwargs: dict) -> int:
+        """How many reply spans a standalone render of ``messages`` contains.
+
+        Rendered on its own rather than counting ``role == "assistant"`` entries,
+        so a reply_open/reply_close-shaped token run anywhere in this prompt slice
+        (e.g. a tool result echoing chat-template text) is counted the same way
+        here as it will be when ``_loss_mask`` scans the full token stream — it
+        can shift *how many* leading spans get skipped, but never *which* span is
+        the new one, since both counts come from the same prompt-only content.
+        """
+        if not messages:
+            return 0
+        text = self.text_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False, **template_kwargs
+        )
+        ids = self.text_tokenizer(text, add_special_tokens=False)["input_ids"]
+        return len(_find_all(ids, self.reply_open))
+
+    def _loss_mask(self, ids: List[int], skip_replies: int = 0) -> List[float]:
         """1.0 on the tokens the model is trained to predict (assistant replies), else 0.0."""
         n = len(ids)
         is_reply = [False] * n  # is_reply[i]: token i belongs to an assistant reply
-        for start in _find_all(ids, self.reply_open):
+        for reply_index, start in enumerate(_find_all(ids, self.reply_open)):
+            if reply_index < skip_replies:
+                continue
             i = start + len(self.reply_open)
             while i < n and ids[i] != self.reply_close:
                 is_reply[i] = True

@@ -7,19 +7,16 @@ reward.
 
 ## Prerequisites
 
+- Run all local commands from the repository root.
 - `Qwen/Qwen3.5-9B` available from Hugging Face or a local `MODEL_PATH`.
 - `/raid/binfeng/data/s2e/s2ev2_full_8k`, with each Harbor task's
   `instruction.md`, `task.toml`, `environment/Dockerfile`, and `tests/test.sh`.
-- Docker and Apptainer to build missing SIFs; only Apptainer is needed once the
-  SIFs exist. Task containers use host networking and internet access so Hermes
-  can install and reach the Polar gateway.
-- If Molt itself runs in a container, expose the host's Apptainer binary,
-  `libexec`, configuration, and state directories and grant its required mount
-  privileges.
+- Docker and Apptainer on the host. Preparation calls them directly; the local
+  RL command exposes Apptainer to the Molt container so Polar can start tasks.
 - Eight GPUs for the local acceptance run. Multi-node runs also require the
   dataset, SIF directory, model/cache, repository, and output directory at the
   same absolute paths on every node.
-- A Molt runtime environment containing the dependencies from this repository.
+- The `hijkzzz/molt:latest` runtime image.
 - A per-process open-file limit of at least 65,536 for Ray and concurrent task
   runtimes. Container launches may need `--ulimit nofile=65536:65536`.
 
@@ -33,7 +30,7 @@ validated. The default preflight starts every selected image and checks its
 stored in the corresponding Polar task.
 
 ```bash
-python3 examples/skill2env/prepare.py \
+PYTHONPATH=. .venv/bin/python examples/skill2env/prepare.py \
   --dataset-dir /raid/binfeng/data/s2e/s2ev2_full_8k \
   --image-dir /raid/binfeng/data/s2e/s2ev2_sif \
   --max-tasks 40 --build-missing
@@ -48,8 +45,29 @@ No rubric or judge model is configured.
 ## Local acceptance run
 
 ```bash
-MODEL_PATH=Qwen/Qwen3.5-9B \
-  bash examples/skill2env/train_rl.sh
+export MOLT_IMAGE=hijkzzz/molt:latest
+
+docker run --rm \
+  --gpus all \
+  --privileged \
+  --ipc=host \
+  --network=host \
+  --ulimit nofile=65536:65536 \
+  --entrypoint bash \
+  -v "$PWD:/molt" \
+  -v /raid:/raid \
+  -v /usr/bin/apptainer:/usr/bin/apptainer:ro \
+  -v /usr/libexec/apptainer:/usr/libexec/apptainer:ro \
+  -v /etc/apptainer:/etc/apptainer:ro \
+  -e MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-9B}" \
+  -e SAVE_ROOT="${SAVE_ROOT:-/molt/outputs/skill2env-rl-qwen3.5-9b}" \
+  -e RESUME="${RESUME:-0}" \
+  -e HF_HOME=/raid/binfeng/.cache/huggingface \
+  "$MOLT_IMAGE" -lc '
+    mkdir -p /var/lib/apptainer/mnt/session
+    cd /molt
+    bash examples/skill2env/train_rl.sh
+  '
 ```
 
 Forty prompts at four prompts per rollout round produce exactly ten optimizer
@@ -82,5 +100,21 @@ is not part of RFC 05 acceptance testing.
 The previous Skill2Env SFT workflow remains available from the same example:
 
 ```bash
-bash examples/skill2env/train_sft.sh
+export MOLT_IMAGE=hijkzzz/molt:latest
+
+docker run --rm \
+  --gpus all \
+  --ipc=host \
+  --network=host \
+  --entrypoint bash \
+  -v "$PWD:/molt" \
+  -v /raid:/raid \
+  -e MODEL_PATH="${SFT_MODEL_PATH:-Qwen/Qwen3.5-4B}" \
+  -e SFT_DATASET="${SFT_DATASET:-/raid/binfeng/data/s2e/skill2env-sft-1k-k3max.parquet}" \
+  -e SAVE_ROOT="${SFT_SAVE_ROOT:-/molt/outputs/skill2env-sft-qwen3.5-4b-128k-1epoch}" \
+  -e HF_HOME=/raid/binfeng/.cache/huggingface \
+  "$MOLT_IMAGE" -lc '
+    cd /molt
+    bash examples/skill2env/train_sft.sh
+  '
 ```

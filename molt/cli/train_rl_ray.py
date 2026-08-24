@@ -196,7 +196,7 @@ def train(args):
                             "inference": {"base_url": router_url},
                             "max_init_workers": args.rollout.gateway_concurrency,
                             "max_run_workers": args.rollout.gateway_concurrency,
-                            "max_postrun_workers": 2 * args.rollout.gateway_concurrency,
+                            "max_postrun_workers": args.rollout.gateway_concurrency,
                         }
                         for node in gateway_nodes
                     ],
@@ -671,10 +671,10 @@ if __name__ == "__main__":
         "--vllm.data_parallel_size",
         type=int,
         default=1,
-        help="data parallel size per vLLM engine (ray DP backend). vLLM has no standalone "
+        help="data parallel size per vLLM engine (single-node mp backend). vLLM has no standalone "
         "expert-parallel size: EP = TP * DP, so raise DP to decouple EP from TP "
         "(DeepSeek-V3-style TP8+DP4 attention -> EP32 experts). An engine spans "
-        "TP*PP*DP GPUs; requires --vllm.enable_expert_parallel and the ray executor.",
+        "TP*PP*DP GPUs; DP > 1 cannot be combined with pipeline parallelism.",
     )
     parser.add_argument("--vllm.sync_backend", type=str, default="nccl", help="trainer -> vLLM weight sync backend")
     parser.add_argument("--vllm.enforce_eager", action="store_true", default=False, help="Disable CUDA graph in vLLM")
@@ -1142,10 +1142,11 @@ if __name__ == "__main__":
             "after the first trains on data the (now updated) weights did not generate."
         )
 
-    assert (
-        args.rollout.n_samples_per_prompt * args.rollout.batch_size // args.rollout.micro_batch_size
-        >= args.actor.num_nodes * args.actor.num_gpus_per_node // get_model_parallel_size(args)
-    ), "The number of sample batches must be greater than or equal to the effective number of actor processes."
+    if not args.eval.eval_only:
+        assert (
+            args.rollout.n_samples_per_prompt * args.rollout.batch_size // args.rollout.micro_batch_size
+            >= args.actor.num_nodes * args.actor.num_gpus_per_node // get_model_parallel_size(args)
+        ), "The number of sample batches must be greater than or equal to the effective number of actor processes."
 
     # --- Eval ---
     if args.eval.batch_size is not None and args.eval.batch_size <= 0:

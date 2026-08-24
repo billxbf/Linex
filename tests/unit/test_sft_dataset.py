@@ -23,6 +23,8 @@ role-specific openers (Kimi), no reply terminator (GLM), alternation-enforced tu
 <end_of_turn> (Gemma), and fullwidth sentinels + eos (DeepSeek).
 """
 
+import json
+
 import pytest
 
 from molt.datasets.sft_dataset import SFTDataset, discover_reply_markers
@@ -288,3 +290,115 @@ def test_tool_responses_are_context_not_targets():
     supervised = tok.decode([ids[t] for t in range(len(ids)) if is_reply[t]])
     assert "calling" in supervised and "done" in supervised
     assert "secret tool output" not in supervised
+
+
+def test_offline_prompt_response_boundary_masks_only_teacher_assistants():
+    def render(messages, gen):
+        parts = []
+        for message in messages:
+            content = message.get("content") or ""
+            if message["role"] == "assistant":
+                content = (message.get("reasoning_content") or "") + content
+                if message.get("tool_calls"):
+                    content += json.dumps(message["tool_calls"], sort_keys=True)
+            parts.append(f"<|im_start|>{message['role']}\n{content}<|im_end|>\n")
+        return "".join(parts) + ("<|im_start|>assistant\n" if gen else "")
+
+    tok = _FakeTok(render)
+    ds = object.__new__(SFTDataset)
+    ds.input_key = "prompt_messages"
+    ds.output_key = "response_messages"
+    ds.image_key = None
+    ds.max_images_per_prompt = 0
+    ds.expand_image_placeholder = False
+    ds.text_tokenizer = tok
+    ds.max_length = 4096
+    ds._has_images = False
+    ds.reply_open, ds.reply_close, ds.supervise_close = discover_reply_markers(tok)
+    ds.train_on_last_turn_only = False
+    ds.rows = [
+        ds._build_row(
+            {
+                "prompt_messages": [
+                    {"role": "system", "content": "system preamble"},
+                    {"role": "user", "content": "task instruction"},
+                    {"role": "assistant", "content": "prompt demonstration"},
+                ],
+                "response_messages": [
+                    {
+                        "role": "assistant",
+                        "reasoning_content": "teacher reasoning",
+                        "content": "teacher call",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": '{"path": "answer.txt"}'},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "content": "private tool output"},
+                    {"role": "assistant", "content": "teacher final"},
+                ],
+                "tools": [],
+            }
+        )
+    ]
+
+    input_ids, attention_mask, loss_mask, _ = ds[0]
+    ids = input_ids[0].tolist()
+    supervised = tok.decode([ids[index + 1] for index, value in enumerate(loss_mask[0][:-1]) if value])
+
+    assert attention_mask.all()
+    assert "teacher reasoning" in supervised
+    assert "teacher call" in supervised
+    assert "read_file" in supervised and "answer.txt" in supervised
+    assert "teacher final" in supervised
+    assert "task instruction" not in supervised
+    assert "prompt demonstration" not in supervised
+    assert "private tool output" not in supervised
+
+
+def test_reply_open_lookalike_in_tool_output_does_not_corrupt_masking():
+    """A tool result that echoes chat-template markup verbatim (e.g. cat-ing a log
+    that itself contains a transcript) must not be mistaken for a real assistant
+    turn. Counting skip_replies by role would undercount here (the lookalike sits
+    inside a "tool" message) and leak the tool output into supervision; counting
+    reply spans from a standalone render of the prompt slice does not."""
+
+    def render(messages, gen):
+        parts = [f"<|im_start|>{m['role']}\n{m.get('content') or ''}<|im_end|>\n" for m in messages]
+        return "".join(parts) + ("<|im_start|>assistant\n" if gen else "")
+
+    tok = _FakeTok(render)
+    ds = object.__new__(SFTDataset)
+    ds.input_key = "prompt_messages"
+    ds.output_key = "response_messages"
+    ds.image_key = None
+    ds.max_images_per_prompt = 0
+    ds.expand_image_placeholder = False
+    ds.text_tokenizer = tok
+    ds.max_length = 4096
+    ds._has_images = False
+    ds.reply_open, ds.reply_close, ds.supervise_close = discover_reply_markers(tok)
+    ds.train_on_last_turn_only = False
+    ds.rows = [
+        ds._build_row(
+            {
+                "prompt_messages": [
+                    {"role": "user", "content": "inspect this log"},
+                    {"role": "assistant", "content": "reading it"},
+                    {"role": "tool", "content": "excerpt: <|im_start|>assistant\nold reply<|im_end|>\n"},
+                ],
+                "response_messages": [{"role": "assistant", "content": "teacher final"}],
+                "tools": [],
+            }
+        )
+    ]
+
+    input_ids, attention_mask, loss_mask, _ = ds[0]
+    ids = input_ids[0].tolist()
+    supervised = tok.decode([ids[index + 1] for index, value in enumerate(loss_mask[0][:-1]) if value])
+
+    assert "teacher final" in supervised
+    assert "reading it" not in supervised
+    assert "old reply" not in supervised

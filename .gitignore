@@ -166,6 +166,7 @@ checkpoints
 
 # local dev files
 rfcs/
+reports/
 reference/
 uv.lock
 

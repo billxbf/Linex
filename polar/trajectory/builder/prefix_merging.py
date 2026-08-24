@@ -9,16 +9,10 @@ trainer needs, without introducing tokenization drift.
 
 Design in two stages:
 
-1. **Grouping** — route each completion to the chain it append-extends, tested
-   purely on tokens: a completion joins the chain whose last prompt is a prefix
-   of it (``C_k.prompt_ids`` is a prefix of ``C_{k+1}.prompt_ids``).  This routes
-   correctly even when parallel agents / sub-agents interleave (each has a
-   distinct prompt prefix), and is robust to BPE re-tokenization because it
-   compares only server-tokenized prompts, whose shared prefix is stable across
-   the special-token generation-prompt boundary.  We never compare the *sampled*
-   ``response_ids`` (those can re-tokenize in the next prompt, e.g.
-   ``[fish, ing]`` → ``[fishing]``); a completion that extends no open chain
-   starts a fresh one.
+1. **Grouping** — route each completion to the chain whose prior prompt messages
+   it append-extends. Message prefixes remain stable when the tokenizer rewrites
+   the generation boundary after a response is appended; a completion that
+   extends no open chain starts a fresh one.
 
 2. **Finalization** — walk each chain and build a merged token stream:
 
@@ -88,17 +82,17 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
             )
 
         chains: list[list[CompletionRecord]] = []
-        chain_tips: list[list[int]] = []  # last completion's prompt_ids, per chain
+        chain_tips: list[list[dict[str, Any]]] = []
 
         for completion in session.completions:
-            prompt_ids = build_trace_from_completion(completion).prompt_ids
-            chain_idx = self._find_extendable_chain(prompt_ids, chain_tips)
+            prompt_messages = build_trace_from_completion(completion).prompt_messages
+            chain_idx = self._find_extendable_chain(prompt_messages, chain_tips)
             if chain_idx is None:
                 chain_idx = len(chains)
                 chains.append([])
                 chain_tips.append([])
             chains[chain_idx].append(completion)
-            chain_tips[chain_idx] = prompt_ids
+            chain_tips[chain_idx] = prompt_messages
 
         stats: dict[str, int] = {
             "chains_total": len(chains),
@@ -168,10 +162,12 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
             Ci_trace = build_trace_from_completion(chain[i])
             Ci_prompt_ids = list(Ci_trace.prompt_ids)
 
-            # Canonical-vs-canonical prefix check: both sides are server-side
-            # tokenizations of the same message prefix — matches reliably
-            # unless the harness rewrote prior messages.
-            if len(Ci_prompt_ids) < len(prev_prompt_ids) or Ci_prompt_ids[: len(prev_prompt_ids)] != prev_prompt_ids:
+            # Appending a response can retokenize the final prompt token at its
+            # boundary (for example "\n" + "\n" becoming one "\n\n" token).
+            prefix_len = len(prev_prompt_ids)
+            if Ci_prompt_ids[:prefix_len] != prev_prompt_ids:
+                prefix_len -= 1
+            if prefix_len <= 0 or Ci_prompt_ids[:prefix_len] != prev_prompt_ids[:prefix_len]:
                 logger.debug(
                     "prefix_merging: canonical prefix break at step %d/%d",
                     i,
@@ -180,7 +176,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
                 break
 
             # canonical_tail = canonical tokens for [prev assistant msg + new interstitials].
-            canonical_tail = Ci_prompt_ids[len(prev_prompt_ids) :]
+            canonical_tail = Ci_prompt_ids[prefix_len:]
             interstitial = self._slice_interstitial(
                 canonical_tail=canonical_tail,
                 prev_raw_response=prev_raw_response,
@@ -332,27 +328,19 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
 
     @staticmethod
     def _find_extendable_chain(
-        prompt_ids: list[int],
-        chain_tips: list[list[int]],
+        prompt_messages: list[dict[str, Any]],
+        chain_tips: list[list[dict[str, Any]]],
     ) -> int | None:
         """Return the open chain this completion append-extends, else None.
 
-        A completion continues a chain iff its prompt begins with that chain's
-        last prompt (``tip`` is a token-prefix of ``prompt_ids``).  This routes
-        completions to the right chain even when parallel agents / sub-agents
-        interleave — each conversation has a distinct prompt prefix — and
-        tolerates the just-finished turn being re-serialized in history (tool-call
-        argument reformatting, whitespace), since that divergence falls *after*
-        the prompt.  The compared prefix is two server-side tokenizations of the
-        same text, so BPE re-tokenization of the sampled response never enters
-        the decision.  On overlap the longest matching tip wins (most advanced
-        chain).
+        A completion continues a chain iff its prompt messages begin with that
+        chain's prior prompt messages. On overlap the longest matching tip wins.
         """
         best_idx: int | None = None
         best_len = -1
         for idx, tip in enumerate(chain_tips):
             n = len(tip)
-            if n > best_len and 0 < n <= len(prompt_ids) and prompt_ids[:n] == tip:
+            if n > best_len and 0 < n <= len(prompt_messages) and prompt_messages[:n] == tip:
                 best_idx, best_len = idx, n
         return best_idx
 

@@ -134,28 +134,42 @@ class SamplesGenerator:
 
     @torch.no_grad()
     def generate_eval_samples(self, **generate_kwargs) -> List[Experience]:
-        """Generate evaluation samples for the entire eval dataloader."""
-        # Eval concurrency is decoupled from the rollout batch; unset falls back to it.
-        # The CLI rejects a non-positive --eval.batch_size, so this cannot be 0 here.
-        eval_batch_size = self.args.eval.batch_size or self.args.rollout.batch_size
-        if getattr(self, "_eval_dataloader_iter", None) is None:
-            self._eval_dataloader_iter = iter(self.eval_dataloader)
-
+        """Generate the full eval set while keeping a fixed rollout window full."""
+        concurrency = self.args.eval.batch_size or self.args.rollout.batch_size
+        dataloader_iter = iter(self.eval_dataloader)
         all_experiences: List[Experience] = []
+        pending_refs = []
+        exhausted = False
+        drop_counts: Dict[str, int] = defaultdict(int)
+        progress = tqdm(total=len(self.eval_dataloader), desc="Generate eval samples")
         try:
-            while True:
-                experiences, _, exhausted = self._generate_batch(
-                    dataloader_iter=self._eval_dataloader_iter,
-                    num_prompts=eval_batch_size,
-                    dynamic_filtering=False,
-                    **generate_kwargs,
-                )
-                all_experiences.extend(experiences)
-                if exhausted:
-                    break
-        finally:
-            self._eval_dataloader_iter = None
+            while pending_refs or not exhausted:
+                free_slots = concurrency - len(pending_refs)
+                if free_slots > 0 and not exhausted:
+                    prompts, task_specs, exhausted = _collect_prompt_batch(dataloader_iter, free_slots)
+                    if prompts:
+                        pending_refs.extend(
+                            self._dispatch_rollouts(
+                                prompts,
+                                task_specs=task_specs,
+                                **generate_kwargs,
+                            )
+                        )
 
+                if not pending_refs:
+                    break
+
+                ready_refs, pending_refs = ray.wait(pending_refs, num_returns=1, timeout=10.0)
+                for ref in ready_refs:
+                    all_experiences.extend(
+                        self._filter_group(ref, False, drop_counts, **generate_kwargs)
+                    )
+                    progress.update()
+        finally:
+            progress.close()
+
+        if drop_counts:
+            logger.info(f"Eval rollout drops: {dict(drop_counts)}")
         return all_experiences
 
     @torch.no_grad()
@@ -303,9 +317,8 @@ class SamplesGenerator:
         The single place the keep/drop policy lives, applying both filters:
         per-response unusable traces and the group-level DAPO dynamic-reward
         filter. Returns ``[]`` when the
-        whole group is dropped. Both the streaming (``generate_samples``) and
-        batch/eval (``_generate_batch``) paths call it, so the per-group filter loop
-        is never reimplemented.
+        whole group is dropped. Both training and eval call this method, so the
+        per-group keep/drop policy stays in one place.
         """
         group_samples: List[Experience] = []
         result = ray.get(finished_rollout)
@@ -360,66 +373,6 @@ class SamplesGenerator:
                 drop_counts["dynamic_filter"] += len(group_samples)
                 return []
         return group_samples
-
-    def _generate_batch(
-        self, dataloader_iter, num_prompts: int, dynamic_filtering, **generate_kwargs
-    ) -> Tuple[List[Experience], int, bool]:
-        """Generate a batch of Experiences with optional reward filtering.
-
-        Dispatches num_prompts to the rollout producer, collects all results, and
-        returns. When dynamic_filtering is enabled, filtered prompts are replaced
-        with new ones.
-        """
-        prompts_consumed = 0
-        accepted_experiences: List[Experience] = []
-        drop_counts: Dict[str, int] = defaultdict(int)
-
-        prompts, task_specs, exhausted = _collect_prompt_batch(dataloader_iter, num_prompts)
-        if not prompts:
-            return [], prompts_consumed, True
-
-        target_num_prompts = len(prompts)
-        pending_refs = self._dispatch_rollouts(
-            prompts,
-            task_specs=task_specs,
-            **generate_kwargs,
-        )
-        prompts_consumed += target_num_prompts
-
-        pbar = tqdm(range(target_num_prompts), desc="Generate samples")
-
-        while pending_refs:
-            ready_refs, pending_refs = ray.wait(pending_refs, num_returns=1, timeout=10.0)
-            for ref in ready_refs:
-                # One ref == one prompt's full rollout (n_samples responses) = one
-                # prompt group. Same keep/drop policy as the streaming path, via the
-                # shared _filter_group (dynamic filtering is per-group, like DAPO).
-                group_experiences = self._filter_group(ref, dynamic_filtering, drop_counts, **generate_kwargs)
-
-                if group_experiences:
-                    accepted_experiences.extend(group_experiences)
-                    pbar.set_postfix({"prompts_consumed": prompts_consumed})
-                    pbar.update()
-                elif dynamic_filtering and not exhausted:
-                    # Dispatch a replacement for the filtered prompt, but only
-                    # while the dataloader still has prompts. Never ray.cancel
-                    # the remaining in-flight rollouts: draining them keeps the
-                    # already-generated valid experiences (and an accurate
-                    # prompts_consumed count) instead of discarding work at the
-                    # dataloader boundary.
-                    new_prompts, new_task_specs, exhausted = _collect_prompt_batch(dataloader_iter, 1)
-                    prompts_consumed += len(new_prompts)
-                    if new_prompts:
-                        new_refs = self._dispatch_rollouts(
-                            new_prompts,
-                            task_specs=new_task_specs,
-                            **generate_kwargs,
-                        )
-                        pending_refs.extend(new_refs)
-
-        if drop_counts:
-            logger.info(f"Eval rollout drops: {dict(drop_counts)}")
-        return accepted_experiences, prompts_consumed, exhausted
 
     def _dispatch_rollouts(
         self,
