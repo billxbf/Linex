@@ -25,7 +25,7 @@ PYTHONPATH=. .venv/bin/python examples/skill2env_sft/prepare.py \
 
 ## Roll out and export the teacher
 
-Run 32 concurrent eval-only Polar sessions over eight TP1 data-parallel Qwen3.8-27B replicas. Each teacher request becomes an independent row in `teacher_sft.jsonl`, with its full conversation history as context.
+Run 64 concurrent eval-only Polar sessions over eight TP1 data-parallel Qwen3.8-27B replicas. Each teacher request becomes an independent row in `teacher_sft.jsonl`, with its full conversation history as context.
 
 By default every well-formed teacher trace is exported regardless of task outcome, so the student imitates full teacher behavior. Set `REJECTION_SAMPLING=1` to keep only traces whose session reward was positive.
 
@@ -56,7 +56,7 @@ docker run --rm \
 
 ## Train the student
 
-Train Qwen3.5-4B on the exported conversations and write the consolidated Hugging Face checkpoint.
+Train Qwen3.5-4B for three epochs on the exported conversations. Each epoch end saves a resumable checkpoint plus an HF snapshot under `$SAVE_ROOT/state/_hf/`, and the final consolidated Hugging Face checkpoint lands at `$FINAL_MODEL`.
 
 ```bash
 export MOLT_IMAGE=hijkzzz/molt:latest

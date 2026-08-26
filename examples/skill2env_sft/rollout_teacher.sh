@@ -41,13 +41,13 @@ python3 -u -m molt.cli.train_rl_ray \
   --actor.model_name_or_path "$MODEL_PATH" \
   --eval.dataset "$TASK_DATASET" \
   --eval.eval_only \
-  --eval.batch_size "${EVAL_BATCH_SIZE:-32}" \
+  --eval.batch_size "${EVAL_BATCH_SIZE:-64}" \
   --eval.n_samples_per_prompt "${TRAJECTORIES_PER_TASK:-1}" \
   --eval.max_new_tokens "${MAX_NEW_TOKENS:-32768}" \
   --data.input_key prompt \
   --data.max_len "$CONTEXT_LENGTH" \
   --rollout.gateway_count "${GATEWAY_COUNT:-1}" \
-  --rollout.gateway_concurrency "${GATEWAY_CONCURRENCY:-32}" \
+  --rollout.gateway_concurrency "${GATEWAY_CONCURRENCY:-64}" \
   --rollout.session_timeout "${SESSION_TIMEOUT:-3600}" \
   --rollout.save_dir "$SAVE_ROOT/rollouts" \
   --rollout.batch_size "${EVAL_BATCH_SIZE:-8}" \

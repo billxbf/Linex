@@ -34,8 +34,9 @@ class ClaudeCodeHarness(BaseHarness):
                         entry["args"] = server.args
                     entry["type"] = "stdio"
                 else:
+                    # Claude Code's config type for streamable-http is "http".
                     entry["url"] = server.url
-                    entry["type"] = server.transport
+                    entry["type"] = "http" if server.transport == "streamable-http" else server.transport
                 mcp_config[server.name] = entry
             config = {"mcpServers": mcp_config}
             config_json = json.dumps(config)
@@ -53,10 +54,13 @@ class ClaudeCodeHarness(BaseHarness):
     def run_steps(self, instruction: str) -> list[ExecInput]:
         escaped = shlex.quote(instruction)
 
+        # Configurable permission mode, defaulting to bypassPermissions —
+        # the same mechanism eval runs use.
+        permission_mode = str(self.settings.get("permission_mode", "bypassPermissions"))
         flags: list[str] = [
             "--verbose",
             "--output-format=stream-json",
-            "--dangerously-skip-permissions",
+            f"--permission-mode={shlex.quote(permission_mode)}",
         ]
         for key, cli in [
             ("max_turns", "--max-turns"),
@@ -75,11 +79,14 @@ class ClaudeCodeHarness(BaseHarness):
         env: dict[str, str] = {
             **self.env,
             "CLAUDE_CONFIG_DIR": self._config_dir,
-            # Allow --dangerously-skip-permissions / bypassPermissions inside
+            # Allow bypassPermissions inside a container
             "IS_SANDBOX": "1",
             # Suppress Statsig / telemetry calls that the CLI otherwise makes
             # to api.anthropic.com even when ANTHROPIC_BASE_URL points elsewhere.
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            # Eval runs enable background tasks; keep training identical.
+            "FORCE_AUTO_BACKGROUND_TASKS": "1",
+            "ENABLE_BACKGROUND_TASKS": "1",
         }
         if self.settings.get("max_thinking_tokens"):
             env["MAX_THINKING_TOKENS"] = str(self.settings["max_thinking_tokens"])
@@ -102,7 +109,7 @@ class ClaudeCodeHarness(BaseHarness):
         return [
             ExecInput(
                 command=(
-                    f"claude {flags_str}{model_flag} -p {escaped} "
+                    f"set -o pipefail && claude {flags_str}{model_flag} -p {escaped} "
                     f"2>&1 | tee {RUNTIME_AGENT_LOG_DIR}/claude-code.txt"
                 ),
                 env=env,

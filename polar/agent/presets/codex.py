@@ -10,7 +10,8 @@ from polar.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR, RUNTIME_SESSI
 from polar.runtime.models import ExecInput
 
 DEFAULT_CODEX_VERSION = "0.125.0"
-DEFAULT_REASONING_EFFORT = "xhigh"
+# Training must sample at the same model_reasoning_effort eval runs default to.
+DEFAULT_REASONING_EFFORT = "high"
 DEFAULT_MODEL_NAME = "gpt-5.5"
 
 
@@ -54,24 +55,6 @@ class CodexHarness(BaseHarness):
             f'sudo chown -R "$(id -u):$(id -g)" {shlex.quote(workdir)} 2>/dev/null || true'
         )
 
-        # Register MCP servers via TOML config
-        if self.mcp_servers:
-            toml_lines: list[str] = []
-            for server in self.mcp_servers:
-                toml_lines.append(f'[mcp_servers."{server.name}"]')
-                if server.transport == "stdio":
-                    toml_lines.append(f'command = "{server.command}"')
-                    if server.args:
-                        args_str = ", ".join(f'"{a}"' for a in server.args)
-                        toml_lines.append(f"args = [{args_str}]")
-                else:
-                    toml_lines.append(f'url = "{server.url}"')
-                    toml_lines.append(f'type = "{server.transport}"')
-            toml_content = "\n".join(toml_lines)
-            await runtime.exec(
-                f"cat > {self._codex_home}/config.toml << 'POLARCFG'\n{toml_content}\nPOLARCFG"
-            )
-
         # Copy skills
         if self.skills_path:
             await runtime.exec(
@@ -86,7 +69,7 @@ class CodexHarness(BaseHarness):
             "CODEX_HOME": self._codex_home,
         }
 
-        # Match Harbor's Codex harness: Codex keeps the default OpenAI provider
+        # Codex keeps the default OpenAI provider
         # and reads the proxy from config.toml. Codex then sends Responses API
         # traffic to $OPENAI_BASE_URL/v1/responses, which Polar captures.
         flags: list[str] = [
@@ -100,12 +83,36 @@ class CodexHarness(BaseHarness):
         for key, cli in [
             ("reasoning_effort", "-c model_reasoning_effort"),
             ("reasoning_summary", "-c model_reasoning_summary"),
+            ("web_search", "-c web_search"),
         ]:
             value = self.settings.get(key)
             if key == "reasoning_effort" and value is None:
                 value = DEFAULT_REASONING_EFFORT
             if value is not None:
                 flags.append(f"{cli}={shlex.quote(str(value))}")
+
+        # Write config.toml in one pass with root keys BEFORE any [mcp_servers.*]
+        # table: in TOML, a key after a table header belongs to that table, so the
+        # previous append-after-setup flow parked openai_base_url inside the last
+        # MCP server entry and codex fell back to api.openai.com.
+        config_writer = (
+            'if [ -n "${OPENAI_BASE_URL:-}" ]; then '
+            "printf 'openai_base_url = \"%s\"\\n\\n' \"$OPENAI_BASE_URL\"; fi; "
+        )
+        if self.mcp_servers:
+            toml_lines: list[str] = []
+            for server in self.mcp_servers:
+                toml_lines.append(f'[mcp_servers."{server.name}"]')
+                if server.transport == "stdio":
+                    toml_lines.append(f'command = "{server.command}"')
+                    if server.args:
+                        args_str = ", ".join(f'"{a}"' for a in server.args)
+                        toml_lines.append(f"args = [{args_str}]")
+                else:
+                    # Remote MCP servers are registered with `url` only.
+                    toml_lines.append(f'url = "{server.url}"')
+            mcp_toml = "\n".join(toml_lines)
+            config_writer += f"cat <<'POLARCODEXMCP'\n{mcp_toml}\nPOLARCODEXMCP\n"
 
         flags_str = " ".join(flags)
         return [
@@ -115,18 +122,14 @@ class CodexHarness(BaseHarness):
                     f"mkdir -p {self._codex_home} && "
                     f'printf \'{{"OPENAI_API_KEY": "%s"}}\' "$OPENAI_API_KEY" '
                     f"> {self._codex_home}/auth.json && "
-                    'if [ -n "${OPENAI_BASE_URL:-}" ]; then '
-                    f"cat >> {self._codex_home}/config.toml <<POLARCODEX\n"
-                    'openai_base_url = "${OPENAI_BASE_URL}"\n'
-                    "POLARCODEX\n"
-                    "fi"
+                    f"{{ {config_writer}}} > {self._codex_home}/config.toml"
                 ),
                 env=env,
             ),
             ExecInput(
                 command=(
                     "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
-                    f"codex exec {flags_str} -- {escaped} "
+                    f"set -o pipefail && codex exec {flags_str} -- {escaped} "
                     f"2>&1 </dev/null | tee {RUNTIME_AGENT_LOG_DIR}/codex.txt"
                 ),
                 env=env,

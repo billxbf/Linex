@@ -154,7 +154,11 @@ class RolloutRayActor:
             args.enable_auto_tool_choice = True
             args.tool_call_parser = tool_call_parser
         if reasoning_parser:
+            # init_app_state reads the reasoning parser from the structured-outputs
+            # config (populated at CLI-parse time, not from the flat attr) — set both,
+            # else reasoning silently lands in message.content.
             args.reasoning_parser = reasoning_parser
+            args.structured_outputs_config.reasoning_parser = reasoning_parser
 
         supported_tasks = await self.llm.get_supported_tasks()
         model_config = self.llm.model_config

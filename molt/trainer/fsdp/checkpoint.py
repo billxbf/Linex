@@ -266,12 +266,16 @@ class CheckpointManager:
                 for name in os.listdir(ckpt_path)
                 if os.path.isdir(os.path.join(ckpt_path, name))
             ]
+            # "best*" and reserved dirs (e.g. the "_hf" export root nested under
+            # ckpt_path) are not versioned checkpoints — never count or prune them.
             regular_subdirs = [
                 (path, mtime)
                 for path, mtime in subdirs
-                if not os.path.basename(path).startswith("best") and os.path.basename(path) != current_tag
+                if not os.path.basename(path).startswith(("best", "_")) and os.path.basename(path) != current_tag
             ]
-            current_regular_count = sum(1 for path, _ in subdirs if not os.path.basename(path).startswith("best"))
+            current_regular_count = sum(
+                1 for path, _ in subdirs if not os.path.basename(path).startswith(("best", "_"))
+            )
             overflow_num = max(0, current_regular_count - max_num) if max_num and max_num > 0 else 0
             overflow_mem = (
                 max_size_bytes is not None and sum(self._dir_size(path) for path, _ in subdirs) > max_size_bytes

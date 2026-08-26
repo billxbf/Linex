@@ -28,7 +28,7 @@ torchrun --standalone --nproc_per_node="${GPUS_PER_NODE:-8}" -m molt.cli.train_s
   --model.model_name_or_path "$MODEL_PATH" \
   --model.freeze_visual_encoder \
   --model.gradient_checkpoint "${GRADIENT_CHECKPOINTING:-full}" \
-  --train.max_epochs "${MAX_EPOCHS:-1}" \
+  --train.max_epochs "${MAX_EPOCHS:-3}" \
   --train.batch_size "${TRAIN_BATCH_SIZE:-1}" \
   --train.micro_batch_size "${MICRO_BATCH_SIZE:-1}" \
   --fsdp.param_dtype bf16 \
@@ -39,8 +39,9 @@ torchrun --standalone --nproc_per_node="${GPUS_PER_NODE:-8}" -m molt.cli.train_s
   --adam.lr "${LR:-1e-6}" \
   --ckpt.path "$SAVE_ROOT/state" \
   --ckpt.output_dir "$FINAL_MODEL" \
-  --ckpt.save_steps "${SAVE_STEPS:-1000000}" \
-  --ckpt.max_num "${MAX_CHECKPOINTS:-1}" \
+  --ckpt.save_steps "${SAVE_STEPS:-0}" \
+  --ckpt.save_hf \
+  --ckpt.max_num "${MAX_CHECKPOINTS:-3}" \
   --logger.logging_steps "${LOGGING_STEPS:-1}" \
   --logger.tensorboard_dir "$SAVE_ROOT/tensorboard" \
   --logger.wandb.project "${WANDB_PROJECT:-skill2env_sft}" \

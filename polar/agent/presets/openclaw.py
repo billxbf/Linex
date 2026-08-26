@@ -30,7 +30,8 @@ class OpenClawHarness(BaseHarness):
     async def setup(self, runtime: BaseRuntime) -> None:
         # `setup` creates the baseline config, workspace, and per-agent session
         # folders ("main" agent dir) that the embedded `--local` run expects.
-        await runtime.exec("openclaw setup --workspace . </dev/null")
+        # --baseline initializes them without the interactive TTY wizard.
+        await runtime.exec("openclaw setup --baseline --workspace . </dev/null")
 
         if self.skills_path:
             await runtime.exec(
@@ -52,10 +53,12 @@ class OpenClawHarness(BaseHarness):
             "--json",
             f"--agent {shlex.quote(agent_id)}",
             f"--model openai/{shlex.quote(model_id)}",
+            # Eval runs default --thinking to high; match it at training time.
+            f"--thinking {shlex.quote(str(self.settings.get('thinking', 'high')))}",
         ]
-        thinking = self.settings.get("thinking")
-        if thinking is not None:
-            flags.append(f"--thinking {shlex.quote(str(thinking))}")
+        timeout = self.settings.get("timeout")
+        if timeout is not None:
+            flags.append(f"--timeout {int(timeout)}")
         flags_str = " ".join(flags)
         escaped = shlex.quote(instruction)
 
@@ -67,7 +70,7 @@ class OpenClawHarness(BaseHarness):
                     f"printf '%s' {shlex.quote(config_json)} "
                     f'| sed "s|{self._BASE_URL_PLACEHOLDER}|$OPENAI_BASE_URL|g" '
                     f"> {self._CONFIG_PATH} && "
-                    f"openclaw agent {flags_str} --message {escaped} "
+                    f"set -o pipefail && openclaw agent {flags_str} --message {escaped} "
                     f"2>&1 </dev/null | tee {RUNTIME_AGENT_LOG_DIR}/openclaw.txt"
                 ),
                 env={**self.env},
@@ -78,6 +81,9 @@ class OpenClawHarness(BaseHarness):
         config: dict = {
             "agents": {"defaults": {"workspace": "."}},
             "gateway": {"mode": "local"},
+            # Headless --local runs have no messaging channel; deny the
+            # message tool so the agent cannot stall on it.
+            "tools": {"deny": ["message"]},
             "models": {
                 "providers": {
                     "openai": {

@@ -7,12 +7,18 @@ import shlex
 
 from polar.agent.base import BaseHarness
 from polar.agent.models import AgentSpec
-from polar.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR
+from polar.runtime.base import RUNTIME_AGENT_LOG_DIR, BaseRuntime
 from polar.runtime.models import ExecInput
 
 
 class QwenCodeHarness(BaseHarness):
-    """Run Qwen Code CLI in non-interactive mode."""
+    """Run Qwen Code CLI in non-interactive mode.
+
+    Matches the eval-side qwen-code setup: MCP servers as a name-keyed
+    ``mcpServers`` object and explicit headless auth
+    (``--auth-type openai --openai-api-key/--openai-base-url``), pointed at the
+    gateway env the run step injects.
+    """
 
     def __init__(self, agent_spec: AgentSpec) -> None:
         super().__init__(agent_spec)
@@ -21,20 +27,17 @@ class QwenCodeHarness(BaseHarness):
     async def setup(self, runtime: BaseRuntime) -> None:
         await runtime.exec(f"mkdir -p {self._qwen_dir}")
 
-        # Register MCP servers
+        # Register MCP servers (object keyed by server name, the CLI's schema).
         if self.mcp_servers:
-            servers_config: list[dict] = []
+            servers: dict[str, dict] = {}
             for server in self.mcp_servers:
-                entry: dict = {"name": server.name, "transport": server.transport}
                 if server.transport == "stdio":
-                    entry["command"] = server.command
-                    if server.args:
-                        entry["args"] = server.args
-                else:
-                    entry["url"] = server.url
-                servers_config.append(entry)
-            config = {"mcpServers": servers_config}
-            config_json = json.dumps(config)
+                    servers[server.name] = {"command": server.command, "args": server.args}
+                elif server.transport == "streamable-http":
+                    servers[server.name] = {"httpUrl": server.url}
+                else:  # sse
+                    servers[server.name] = {"url": server.url}
+            config_json = json.dumps({"mcpServers": servers}, indent=2)
             await runtime.exec(
                 f"cat > {self._qwen_dir}/settings.json << 'POLARCFG'\n{config_json}\nPOLARCFG"
             )
@@ -51,14 +54,19 @@ class QwenCodeHarness(BaseHarness):
         env: dict[str, str] = {**self.env}
         # qwen-code reads the model from OPENAI_MODEL; passing both an env var
         # and a --model CLI flag created conflicts on proxied backends, so only
-        # the env var form is used
+        # the env var form is used. The provider prefix is stripped.
         if self.model_name:
-            env["OPENAI_MODEL"] = self.model_name
+            env["OPENAI_MODEL"] = self.model_name.split("/", 1)[-1]
 
         return [
             ExecInput(
                 command=(
-                    f"qwen --yolo --prompt={escaped} "
+                    # Pin headless auth to the OpenAI-compatible gateway; the
+                    # auth dialog cannot render under --prompt.
+                    "set -o pipefail && qwen --yolo --auth-type openai "
+                    '--openai-api-key "$OPENAI_API_KEY" '
+                    '--openai-base-url "$OPENAI_BASE_URL" '
+                    f"--prompt={escaped} "
                     f"2>&1 | tee {RUNTIME_AGENT_LOG_DIR}/qwen-code.txt"
                 ),
                 env=env,

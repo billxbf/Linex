@@ -57,7 +57,9 @@ class OpenHandsSdkHarness(BaseHarness):
         if self.skills_path:
             env["SKILL_PATHS"] = self.skills_path
 
-        # Map settings to env
+        # Map settings to env. MAX_ITERATIONS is only set when configured, so
+        # the SDK's own iteration default applies — the same cap eval runs
+        # leave unset.
         for key, env_key in [
             ("max_iterations", "MAX_ITERATIONS"),
             ("temperature", "LLM_TEMPERATURE"),
@@ -67,8 +69,6 @@ class OpenHandsSdkHarness(BaseHarness):
             if value is not None:
                 env[env_key] = str(value)
 
-        env.setdefault("MAX_ITERATIONS", "8")
-
         return [
             ExecInput(
                 command=(
@@ -76,7 +76,7 @@ class OpenHandsSdkHarness(BaseHarness):
                     'PYTHON_BIN="$HOME/.venv/bin/python"; '
                     '[ -x "$PYTHON_BIN" ] || PYTHON_BIN="/opt/openhands-sdk-venv/bin/python"; '
                     '[ -x "$PYTHON_BIN" ] || PYTHON_BIN="$(command -v python3 || command -v python)"; '
-                    '"$PYTHON_BIN" '
+                    'set -o pipefail && "$PYTHON_BIN" '
                     f"{self._runner_script} "
                     f"2>&1 | tee {RUNTIME_AGENT_LOG_DIR}/openhands-sdk.txt"
                 ),
@@ -179,7 +179,7 @@ def main():
     model = os.environ.get("LLM_MODEL", "openai/gpt-5.4")
     api_key = os.environ.get("LLM_API_KEY", "")
     base_url = os.environ.get("LLM_BASE_URL", "")
-    max_iterations = int(os.environ.get("MAX_ITERATIONS", "30"))
+    max_iterations = os.environ.get("MAX_ITERATIONS")
     temperature = os.environ.get("LLM_TEMPERATURE")
     max_output_tokens = os.environ.get("LLM_MAX_OUTPUT_TOKENS")
 
@@ -214,11 +214,10 @@ def main():
     agent = Agent(**agent_kwargs)
     workspace = os.environ.get("WORKSPACE_BASE") or os.getcwd()
 
-    conversation = Conversation(
-        agent=agent,
-        workspace=workspace,
-        max_iteration_per_run=max_iterations,
-    )
+    conv_kwargs = dict(agent=agent, workspace=workspace)
+    if max_iterations:
+        conv_kwargs["max_iteration_per_run"] = int(max_iterations)
+    conversation = Conversation(**conv_kwargs)
     conversation.send_message(instruction)
     conversation.run()
     conversation.close()

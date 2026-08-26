@@ -87,10 +87,15 @@ class PiHarness(BaseHarness):
                     'export PATH="$HOME/.local/node/bin:$HOME/.local/bin:$PATH" && '
                     # $OPENAI_BASE_URL is substituted at exec time; the
                     # placeholder keeps the JSON static (no shell quoting fun).
+                    # Atomic write: $HOME (and thus the agent dir) is shared by
+                    # concurrent sessions; a plain > lets another pi read a
+                    # truncated models.json mid-write and crash on startup.
                     f"printf '%s' {shlex.quote(config_json)} "
                     f'| sed "s|__POLAR_GATEWAY_BASE_URL__|$OPENAI_BASE_URL|g" '
-                    f"> {self._AGENT_DIR}/models.json && "
-                    f"pi --print --mode json --no-session "
+                    f"> {self._AGENT_DIR}/models.json.$$ && "
+                    f"mv {self._AGENT_DIR}/models.json.$$ {self._AGENT_DIR}/models.json && "
+                    # pipefail so a crashed pi is not masked by tee's exit 0.
+                    f"set -o pipefail && pi --print --mode json --no-session "
                     f"--provider {shlex.quote(provider)} "
                     f"--model {shlex.quote(model_id)}"
                     f"{flags_str} "

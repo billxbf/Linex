@@ -19,7 +19,7 @@ class MiniSweAgentHarness(BaseHarness):
     provider so LiteLLM uses that transport; the gateway rewrites the model id to
     the served model regardless, so the id itself is cosmetic.
 
-    Mirrors Harbor's mini-swe-agent setup: ``--yolo`` (no confirmations),
+    Matches the eval-side mini-swe-agent setup: ``--yolo`` (no confirmations),
     ``--cost-limit 0`` (disabled) plus ``MSWEA_COST_TRACKING=ignore_errors`` so the
     served model's missing price table doesn't error, ``MSWEA_CONFIGURED=true`` to
     skip the first-run interactive setup, and ``--exit-immediately`` to finish
@@ -51,7 +51,7 @@ class MiniSweAgentHarness(BaseHarness):
                     'export PATH="$HOME/.local/bin:$PATH" && '
                     # LiteLLM reads OPENAI_API_BASE; the gateway only sets OPENAI_BASE_URL.
                     'export OPENAI_API_BASE="$OPENAI_BASE_URL" && '
-                    f"mini-swe-agent {flags_str} "
+                    f"set -o pipefail && mini-swe-agent {flags_str} "
                     f"2>&1 | tee {RUNTIME_AGENT_LOG_DIR}/mini-swe-agent.txt"
                 ),
                 env={

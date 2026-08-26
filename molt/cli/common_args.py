@@ -77,7 +77,10 @@ def add_ckpt_args(parser, default_ckpt_path: str) -> None:
         help="Directory for the final consolidated HF safetensors export.",
     )
     parser.add_argument(
-        "--ckpt.save_steps", type=int, default=-1, help="Save a resumable checkpoint every N steps; -1 disables it."
+        "--ckpt.save_steps",
+        type=int,
+        default=-1,
+        help="Save a resumable checkpoint every N steps; -1 disables it; 0 saves once per epoch (SFT only).",
     )
     parser.add_argument(
         "--ckpt.save_hf",

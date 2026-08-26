@@ -223,6 +223,8 @@ class SFTTrainer:
             args.eval.steps = num_update_steps_per_epoch  # Evaluate once per epoch
         if args.ckpt.save_steps == -1:
             args.ckpt.save_steps = float("inf")  # do not save ckpt
+        elif args.ckpt.save_steps == 0:
+            args.ckpt.save_steps = num_update_steps_per_epoch  # Save once per epoch
 
         # Restore step and start_epoch
         # step is 1-indexed: the logging check (step % accum_grad == 0) fires at multiples of accum_grad,

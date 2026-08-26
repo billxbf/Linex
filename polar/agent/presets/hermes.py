@@ -89,7 +89,11 @@ class HermesHarness(BaseHarness):
             # Disable the self-improvement loop so runs stay stateless and don't
             # write memory/profile files into the agent home.
             "memory": {"memory_enabled": False, "user_profile_enabled": False},
+            # Context compression and the delegation cap change what the model
+            # sees, so training must run with the same values eval runs use.
+            "compression": {"enabled": True, "threshold": 0.85},
             "terminal": {"backend": "local", "timeout": 180},
+            "delegation": {"max_iterations": 50},
             "checkpoints": {"enabled": False},
         }
 

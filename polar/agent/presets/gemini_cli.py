@@ -7,37 +7,68 @@ import shlex
 
 from polar.agent.base import BaseHarness
 from polar.agent.models import AgentSpec
-from polar.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR
+from polar.runtime.base import RUNTIME_AGENT_LOG_DIR, BaseRuntime
 from polar.runtime.models import ExecInput
 
 
 class GeminiCliHarness(BaseHarness):
-    """Run Google Gemini CLI in non-interactive mode."""
+    """Run Google Gemini CLI in non-interactive mode.
+
+    Config matches the eval-side gemini-cli setup so trained behavior
+    transfers: same settings.json shape (auth pinning, mcpServers object,
+    experimental.skills, thinking-level model alias) and the same run flags.
+    """
 
     def __init__(self, agent_spec: AgentSpec) -> None:
         super().__init__(agent_spec)
         self._gemini_dir = "$HOME/.gemini"
+        # Headless `gemini --prompt` cannot show the auth-method dialog, and its
+        # auto-detection breaks when a custom GOOGLE_GEMINI_BASE_URL is set (the
+        # gateway case), so pin API-key auth.
+        self._config: dict = {"security": {"auth": {"selectedType": "gemini-api-key"}}}
+        self._run_model = self.model_name
+
+        if self.mcp_servers:
+            servers: dict[str, dict] = {}
+            for server in self.mcp_servers:
+                if server.transport == "stdio":
+                    servers[server.name] = {"command": server.command, "args": server.args}
+                elif server.transport == "streamable-http":
+                    servers[server.name] = {"httpUrl": server.url}
+                else:  # sse
+                    servers[server.name] = {"url": server.url}
+            self._config["mcpServers"] = servers
+
+        # Thinking level rides on a custom model alias, the CLI's only
+        # non-interactive way to set a thinkingConfig.
+        reasoning_effort = self.settings.get("reasoning_effort")
+        if self.model_name and reasoning_effort:
+            effort = str(reasoning_effort)
+            self._run_model = f"polar-{self.model_name}-{effort}"
+            self._config["modelConfigs"] = {
+                "customAliases": {
+                    self._run_model: {
+                        "modelConfig": {
+                            "model": self.model_name,
+                            "generateContentConfig": {
+                                "thinkingConfig": {
+                                    "includeThoughts": True,
+                                    "thinkingLevel": effort.upper(),
+                                },
+                            },
+                        }
+                    }
+                }
+            }
+
+        self._config["experimental"] = {"skills": True}
 
     async def setup(self, runtime: BaseRuntime) -> None:
-        await runtime.exec(f"mkdir -p {self._gemini_dir}")
-
-        # Register MCP servers
-        if self.mcp_servers:
-            servers_config: list[dict] = []
-            for server in self.mcp_servers:
-                entry: dict = {"name": server.name, "transport": server.transport}
-                if server.transport == "stdio":
-                    entry["command"] = server.command
-                    if server.args:
-                        entry["args"] = server.args
-                else:
-                    entry["url"] = server.url
-                servers_config.append(entry)
-            config = {"mcpServers": servers_config}
-            config_json = json.dumps(config)
-            await runtime.exec(
-                f"cat > {self._gemini_dir}/settings.json << 'POLARCFG'\n{config_json}\nPOLARCFG"
-            )
+        config_json = json.dumps(self._config, indent=2)
+        await runtime.exec(
+            f"mkdir -p {self._gemini_dir} && "
+            f"cat > {self._gemini_dir}/settings.json << 'POLARCFG'\n{config_json}\nPOLARCFG"
+        )
 
         # Copy skills
         if self.skills_path:
@@ -53,13 +84,9 @@ class GeminiCliHarness(BaseHarness):
             **self.env,
         }
 
-        # --approval-mode=yolo is the documented replacement for the legacy
-        # --yolo flag (both currently work but --yolo is listed as deprecated
-        # in the latest CLI reference). Sandbox is off by default; we only
-        # pass --sandbox when the caller explicitly opts in.
-        flags: list[str] = ["--approval-mode=yolo"]
-        if self.model_name:
-            flags.append(f"--model={shlex.quote(self.model_name)}")
+        flags: list[str] = ["--yolo"]
+        if self._run_model:
+            flags.append(f"--model={shlex.quote(self._run_model)}")
         if self.settings.get("sandbox") is True:
             flags.append("--sandbox")
 
@@ -72,7 +99,7 @@ class GeminiCliHarness(BaseHarness):
                     # so map one onto the other to route calls at the proxy.
                     'export GEMINI_API_KEY="$GOOGLE_API_KEY" '
                     'GOOGLE_GEMINI_BASE_URL="$GOOGLE_API_URL" && '
-                    f"gemini {flags_str} --prompt={escaped} "
+                    f"set -o pipefail && gemini {flags_str} --prompt={escaped} "
                     f"2>&1 </dev/null | tee {RUNTIME_AGENT_LOG_DIR}/gemini-cli.txt"
                 ),
                 env=env,
