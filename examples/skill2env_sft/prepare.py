@@ -55,7 +55,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--max-tasks", type=int, default=-1, help="Task count; -1 selects all tasks.")
     parser.add_argument("--task", action="append", default=[], help="Select a task directory name; repeatable.")
-    parser.add_argument("--model-name", default="openai/Qwen/Qwen3.8-27B")
+    parser.add_argument("--model-name", default="openai/Inferact/GLM-5.3-NVFP4")
     parser.add_argument("--context-window", type=int, default=131072)
     parser.add_argument("--build-missing", action="store_true", help="Build missing SIFs with Docker and Apptainer.")
     parser.add_argument("--force", action="store_true", help="Rebuild selected SIFs.")
@@ -99,8 +99,8 @@ def main() -> int:
                 raise SystemExit(f"Incomplete Skill2Env task {name}: missing {required}")
 
         dockerfile_source = dockerfile.read_text()
-        workdirs = re.findall(r"^\s*WORKDIR\s+(\S+)", dockerfile_source, re.IGNORECASE | re.MULTILINE)
-        workdir = workdirs[-1] if workdirs else "/workspace"
+        workdirs = re.findall(r"^\s*WORKDIR\s+(.+?)\s*$", dockerfile_source, re.IGNORECASE | re.MULTILINE)
+        workdir = workdirs[-1].strip("\"'") if workdirs else "/workspace"
         metadata = tomllib.loads(task_file.read_text())
         normalized = re.sub(r"[^a-z0-9_.-]+", "-", name.lower().replace("__", "--")).strip("-")
         image = image_dir / f"{normalized}.sif"

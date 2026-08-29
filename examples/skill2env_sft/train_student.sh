@@ -29,14 +29,14 @@ torchrun --standalone --nproc_per_node="${GPUS_PER_NODE:-8}" -m molt.cli.train_s
   --model.freeze_visual_encoder \
   --model.gradient_checkpoint "${GRADIENT_CHECKPOINTING:-full}" \
   --train.max_epochs "${MAX_EPOCHS:-3}" \
-  --train.batch_size "${TRAIN_BATCH_SIZE:-1}" \
+  --train.batch_size "${TRAIN_BATCH_SIZE:-16}" \
   --train.micro_batch_size "${MICRO_BATCH_SIZE:-1}" \
   --fsdp.param_dtype bf16 \
   --fsdp.attn_implementation "${FSDP_ATTN_IMPLEMENTATION:-sdpa}" \
   --fsdp.tp_size "${TP_SIZE:-1}" \
   --fsdp.ep_size "${EP_SIZE:-1}" \
   --fsdp.cp_size "${CP_SIZE:-8}" \
-  --adam.lr "${LR:-1e-6}" \
+  --adam.lr "${LR:-5e-6}" \
   --ckpt.path "$SAVE_ROOT/state" \
   --ckpt.output_dir "$FINAL_MODEL" \
   --ckpt.save_steps "${SAVE_STEPS:-0}" \

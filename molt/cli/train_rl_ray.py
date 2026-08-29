@@ -118,6 +118,7 @@ def train(args):
             async_scheduling=args.vllm.async_scheduling,
             decode_context_parallel_size=args.vllm.decode_context_parallel_size,
             dtype=args.vllm.dtype,
+            kv_cache_dtype=args.vllm.kv_cache_dtype,
             block_size=args.vllm.block_size,
             mtp_num_speculative_tokens=args.vllm.mtp_num_speculative_tokens,
             pipeline_parallel_size=getattr(args.vllm, "pipeline_parallel_size", 1),
@@ -706,6 +707,12 @@ if __name__ == "__main__":
         "(Qwen3.6-MoE). Lossless (target verifies every token). 1 is a good default.",
     )
     parser.add_argument("--vllm.dtype", type=str, default="bfloat16", help="vLLM inference dtype")
+    parser.add_argument(
+        "--vllm.kv_cache_dtype",
+        type=str,
+        default=None,
+        help="vLLM KV cache dtype override (e.g. fp8_e4m3); unset keeps vLLM auto.",
+    )
     parser.add_argument(
         "--vllm.gpu_memory_utilization",
         type=float,

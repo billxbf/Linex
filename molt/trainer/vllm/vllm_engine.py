@@ -315,6 +315,7 @@ def create_vllm_engines(
     async_scheduling: Optional[bool] = None,
     decode_context_parallel_size: int = 1,
     dtype: str = "bfloat16",
+    kv_cache_dtype: Optional[str] = None,
     block_size: Optional[int] = None,
     mtp_num_speculative_tokens: int = 0,
     pipeline_parallel_size: int = 1,
@@ -474,6 +475,9 @@ def create_vllm_engines(
             # backend must be passed via EngineArgs (e.g. "TRITON_ATTN" to
             # avoid AOT-compiled FlashAttention 2 PTX kernels on older drivers).
             actor_kwargs["attention_backend"] = attention_backend
+
+        if kv_cache_dtype:
+            actor_kwargs["kv_cache_dtype"] = kv_cache_dtype
 
         if block_size:
             # KV cache block size (tokens). MiniMax-M3's MSA sparse attention

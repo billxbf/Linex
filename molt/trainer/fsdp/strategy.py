@@ -358,12 +358,14 @@ class FsdpStrategy:
         self._max_norm_by_optimizer[id(optimizer)] = cfg.get("max_norm", self.max_norm)
 
         scheduler_steps = cfg["scheduler_steps"]
+        scheduler_name = cfg.get("lr_scheduler", "constant")
         scheduler = get_scheduler(
-            cfg.get("lr_scheduler", "constant"),
+            scheduler_name,
             optimizer,
             num_warmup_steps=math.ceil(scheduler_steps * cfg.get("lr_warmup_ratio", 0.03)),
             num_training_steps=scheduler_steps,
-            scheduler_specific_kwargs={"min_lr_rate": cfg.get("min_lr_ratio", 0.1)},
+            # min_lr_rate is only a valid kwarg for *_with_min_lr schedules; linear/constant/cosine reject it.
+            scheduler_specific_kwargs={"min_lr_rate": cfg.get("min_lr_ratio", 0.1)} if "min_lr" in scheduler_name else None,
         )
         return model, optimizer, scheduler
 
