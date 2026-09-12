@@ -105,6 +105,10 @@ def prepare_datasets(strategy):
             * args.train.num_episodes
             * args.train.max_epochs
         )
+    if getattr(args.train, "max_steps", None) is not None:
+        if args.train.max_steps <= 0:
+            raise ValueError("--train.max_steps must be positive")
+        max_steps = min(max_steps, args.train.max_steps)
     return prompts_dataloader, eval_dataloader, max_steps
 
 
@@ -270,10 +274,13 @@ class BaseRLTrainer:
         self.best_eval_metric_value = float("-inf")
         self.best_eval_metric_key = getattr(self.args.ckpt, "best_metric_key", "") or ""
         self._latest_eval_metric_value = None
+        self.reward_history = []
 
     def restore_best_metric_tracker(self, checkpoint_states) -> None:
         if not checkpoint_states:
             return
+
+        self.reward_history = checkpoint_states.get("reward_history", [])
 
         checkpoint_metric_key = checkpoint_states.get("best_eval_metric_key")
         checkpoint_metric_value = checkpoint_states.get("best_eval_metric_value")
@@ -329,6 +336,7 @@ class BaseRLTrainer:
         # on every rollout sample, and computed on `rollout_samples` (before balance_experiences drops
         # the trailing remainder), so num_samples and the means reflect everything we generated.
         per_rollout, per_group = _collect_rollout_rewards(rollout_samples)
+        logger.info("Rollout rewards for update %s: rollouts=%s groups=%s", global_step + 1, per_rollout, per_group)
         response_lengths = torch.cat([s.response_length for s in rollout_samples if s.response_length is not None])
         truncated = torch.cat([s.truncated for s in rollout_samples if s.truncated is not None])
         num_turn_rows = sum(s.info["reward"].numel() for s in rollout_samples if "reward" in s.info)
@@ -805,6 +813,7 @@ class TrainingActor(BaseRLTrainer):
         self.vllm_lock = vllm_lock
         self._prefix_caching_enabled = getattr(strategy.args.vllm, "enable_prefix_caching", False)
         self._gateway_pause_timeout = strategy.args.rollout.session_timeout
+        self._refit_drain = bool(getattr(strategy.args.rollout, "refit_drain", False))
         self.polar_gateways = polar_gateways or []
         self.rollout_queue = rollout_queue
         self.rollout_slots = rollout_slots
@@ -871,13 +880,30 @@ class TrainingActor(BaseRLTrainer):
 
             # rollout/dropped/<reason> counts + dynamic_filtering_pass_rate (when enabled).
             status.update(rollout_metrics)
+            self.reward_history = (self.reward_history + [status["rollout/reward_mean"]])[-8:]
+            if global_step >= 12 and len(self.reward_history) == 8:
+                status["rollout/reward_ma8"] = statistics.fmean(self.reward_history)
 
             log_status = {k: v for k, v in status.items() if k not in ["generated_samples"]}
             logger.info(f"Global step {global_step}: {log_status}")
 
             client_states.update({"global_step": global_step})
+            client_states["reward_history"] = self.reward_history
             self._latest_client_states = client_states
             self.save_logs_and_checkpoints(global_step, status, client_states)
+            if global_step >= self.max_steps:
+                break
+
+        if self._latest_client_states and global_step % self.args.ckpt.save_steps != 0:
+            refs = []
+            for group in (self.actor_model_group, self.critic_model_group):
+                if group is None:
+                    continue
+                refs += group.async_run_method(
+                    method_name="save_checkpoint", tag=f"global_step{global_step}",
+                    client_states=self._latest_client_states,
+                )
+            ray.get(refs)
 
         if self.wandb_logger:
             self.wandb_logger.close()
@@ -896,9 +922,21 @@ class TrainingActor(BaseRLTrainer):
         _t0 = time.time()
         engines_paused = False
         try:
-            ray.get([gateway.pause.remote(self._gateway_pause_timeout) for gateway in self.polar_gateways])
-            engines_paused = True
+            # Freeze the engines first (vLLM mode="keep": in-flight requests keep their blocks and
+            # sit in the scheduler), then stop the gateways from forwarding new turns. Without
+            # --rollout.refit_drain the gateways do not wait for their in-flight completions:
+            # those requests are frozen in the engine, and reset_prefix_cache(reset_running_requests)
+            # below re-prefills them under the new weights on resume. Draining instead let every
+            # in-flight turn (up to max_new_tokens) run to its end while no new turn could start,
+            # which idled the engines for 5-7 minutes per push.
             batch_vllm_engine_call(self.vllm_engines, "pause_generation")
+            engines_paused = True
+            ray.get(
+                [
+                    gateway.pause.remote(self._gateway_pause_timeout, self._refit_drain)
+                    for gateway in self.polar_gateways
+                ]
+            )
             super().broadcast_to_vllm()
             if self._prefix_caching_enabled:
                 batch_vllm_engine_call(self.vllm_engines, "reset_prefix_cache")
@@ -1003,12 +1041,16 @@ class RLTrainer:
                 ]
             )
 
-        ray.get(
-            [
-                self.generator_actor.fit.remote(episode=start_episode, total_consumed_prompts=total_consumed_prompts),
-                self.trainer_actor.fit.remote(global_step=global_step),
-            ]
-        )
+        generator = self.generator_actor.fit.remote(episode=start_episode, total_consumed_prompts=total_consumed_prompts)
+        trainer = self.trainer_actor.fit.remote(global_step=global_step)
+        finished, _ = ray.wait([generator, trainer], num_returns=1)
+        ray.get(finished)
+        if generator in finished:
+            ray.get(trainer)
+        else:
+            # The update limit can finish before the prefetched sessions. Their tensors
+            # are no longer needed once training and checkpointing have completed.
+            ray.kill(self.generator_actor)
 
     def get_max_steps(self):
         return ray.get(self.generator_actor.get_max_steps.remote())

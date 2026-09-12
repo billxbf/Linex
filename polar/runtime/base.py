@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Final
@@ -153,39 +154,32 @@ class BaseRuntime(ABC):
     ) -> tuple[int, str | None, str | None]:
         """Run a local subprocess, optionally capturing stdout/stderr."""
         process_env = None if env is None else {**os.environ, **env}
-        if capture:
-            stdout_target = asyncio.subprocess.PIPE
-            stderr_target = asyncio.subprocess.PIPE
-        else:
-            stdout_target = asyncio.subprocess.DEVNULL
-            stderr_target = asyncio.subprocess.DEVNULL
-
-        process = await asyncio.create_subprocess_exec(
-            *args,
-            env=process_env,
-            stdout=stdout_target,
-            stderr=stderr_target,
-        )
-        self._active_process = process
-        try:
-            if timeout is None:
-                stdout_bytes, stderr_bytes = await process.communicate()
-            else:
+        # Background descendants can retain extra pipe descriptors after the command exits.
+        # File capture makes completion depend on the command's exit, not inherited pipe EOF.
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                env=process_env,
+                stdout=stdout_file if capture else asyncio.subprocess.DEVNULL,
+                stderr=stderr_file if capture else asyncio.subprocess.DEVNULL,
+            )
+            self._active_process = process
+            try:
                 try:
-                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                        process.communicate(), timeout=timeout
-                    )
+                    await asyncio.wait_for(process.wait(), timeout=timeout)
                 except asyncio.TimeoutError:
-                    process.kill()
+                    # Exit can race the deadline; a missing pid still counts as a timeout.
                     try:
+                        process.kill()
                         await process.wait()
                     except ProcessLookupError:
                         pass
                     return -1, None, None
-        finally:
-            self._active_process = None
-
-        rc = process.returncode or 0
+            finally:
+                self._active_process = None
+            rc = process.returncode or 0
+            stdout_bytes = os.pread(stdout_file.fileno(), os.fstat(stdout_file.fileno()).st_size, 0)
+            stderr_bytes = os.pread(stderr_file.fileno(), os.fstat(stderr_file.fileno()).st_size, 0)
         stdout_str = stdout_bytes.decode(errors="replace") if stdout_bytes else None
         stderr_str = stderr_bytes.decode(errors="replace") if stderr_bytes else None
         return rc, stdout_str, stderr_str

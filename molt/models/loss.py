@@ -250,6 +250,22 @@ def cispo_policy_loss(ratio, advantages, log_probs, action_mask, *, clip_eps_hig
     return loss, clip_ratio
 
 
+@register_policy_loss("dppo")
+def dppo_policy_loss(ratio, advantages, log_probs, action_mask, *, old_log_probs, dppo_kl_threshold, **_):
+    """DPPO binary KL: block only updates moving farther outside the rollout trust region.
+
+    https://arxiv.org/abs/2602.04879, equations 12 and 14.
+    """
+    with torch.no_grad():
+        # Roundoff can make sampled probabilities exactly zero or one.
+        p = old_log_probs.float().exp().clamp(1e-7, 1 - 1e-7)
+        q = log_probs.float().exp().clamp(1e-7, 1 - 1e-7)
+        divergence = p * (p.log() - q.log()) + (1 - p) * (torch.log1p(-p) - torch.log1p(-q))
+        blocked = (divergence > dppo_kl_threshold) & (advantages * (ratio - 1) > 0)
+    loss = torch.where(blocked, 0.0, -ratio * advantages)
+    return loss, masked_mean(blocked.float(), action_mask, dim=None)
+
+
 class PolicyLoss(nn.Module):
     """
     Clipped policy-gradient loss for non-critic RL.
@@ -270,6 +286,7 @@ class PolicyLoss(nn.Module):
         is_correction_mode: str = "mask",
         loss_agg_mode: str = "token-mean",
         loss_mode: str = "ppo",
+        dppo_kl_threshold: float = 0.05,
     ) -> None:
         super().__init__()
         self.clip_eps_low = clip_eps_low
@@ -292,7 +309,13 @@ class PolicyLoss(nn.Module):
         self.is_correction_mode = is_correction_mode
         self.loss_agg_mode = loss_agg_mode
         self.loss_mode = loss_mode
+        self.dppo_kl_threshold = dppo_kl_threshold
         self.policy_loss_fn = get_policy_loss(loss_mode)  # raises on an unregistered name
+        if loss_mode == "dppo":
+            if not 0 < dppo_kl_threshold < float("inf"):
+                raise ValueError("dppo_kl_threshold must be finite and positive")
+            if is_correction_level != "off":
+                raise ValueError("DPPO already uses the rollout importance ratio; set is_correction_level='off'")
         # Dual-clip policy objective: https://arxiv.org/pdf/1912.09729
         if dual_clip is not None:
             assert dual_clip > 1.0, f"dual_clip must be > 1.0, got {dual_clip}"
@@ -332,6 +355,10 @@ class PolicyLoss(nn.Module):
         batch_num_tokens: Optional[torch.Tensor] = None,
         global_batch_size: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.loss_mode == "dppo":
+            if rollout_log_probs is None:
+                raise ValueError("rollout_log_probs is required for DPPO")
+            old_log_probs = rollout_log_probs.detach()
         log_ratio_limit = 30.0
         policy_log_ratio = torch.nan_to_num(
             log_probs.float() - old_log_probs.float(),
@@ -355,6 +382,8 @@ class PolicyLoss(nn.Module):
             clip_eps_high=self.clip_eps_high,
             dual_clip=self.dual_clip,
             policy_log_ratio=policy_log_ratio,
+            old_log_probs=old_log_probs,
+            dppo_kl_threshold=self.dppo_kl_threshold,
         )
 
         vllm_kl = None

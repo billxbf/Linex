@@ -340,7 +340,7 @@ def test_compute_approx_kl_sanitizes_equal_negative_infinity_logprobs():
 def test_policy_loss_registry_rejects_unknown_and_duplicate_names():
     from molt.models.loss import POLICY_LOSSES, get_policy_loss, register_policy_loss
 
-    assert {"ppo", "cispo", "gspo"} <= set(POLICY_LOSSES)  # built-in surrogates are registered
+    assert {"ppo", "cispo", "gspo", "dppo"} <= set(POLICY_LOSSES)
     with pytest.raises(ValueError, match="Unknown policy loss"):
         get_policy_loss("nope")
     with pytest.raises(ValueError, match="Unknown policy loss"):
@@ -419,3 +419,88 @@ def test_gspo_gradient_reaches_each_token_through_its_own_log_prob():
 def test_gspo_rejects_dual_clip():
     with pytest.raises(ValueError, match="dual_clip is a PPO-only extra bound"):
         PolicyLoss(loss_mode="gspo", dual_clip=3.0)
+
+
+def test_dppo_directional_mask_uses_rollout_probabilities_and_uncapped_ratio():
+    rollout = torch.tensor([[0.2, 0.8, 0.8, 0.2, 0.2, 0.001]]).log().requires_grad_()
+    logp = torch.tensor([[0.8, 0.2, 0.2, 0.8, 0.3, 0.01]]).log().requires_grad_()
+    advantage = torch.tensor([[1.0, -1.0, 1.0, -1.0, 1.0, 1.0]])
+    mask = torch.ones_like(logp, dtype=torch.bool)
+
+    # Passing the current policy as "old" must not hide rollout drift under a single update.
+    loss, _, blocked, policy_kl, vllm_kl, correction = PolicyLoss(loss_mode="dppo")(
+        logp, logp.detach(), advantage, action_mask=mask, rollout_log_probs=rollout
+    )
+    loss.backward()
+
+    # First two updates move farther outside the region; the next two move back toward it.
+    # The last token moves little probability mass, so its ratio of 10 must stay uncapped.
+    expected = torch.tensor([[0.0, 0.0, -0.25, 4.0, -1.5, -10.0]]) / 6
+    torch.testing.assert_close(logp.grad, expected)
+    torch.testing.assert_close(loss, expected.sum())
+    torch.testing.assert_close(blocked, torch.tensor(2 / 6))
+    torch.testing.assert_close(policy_kl, (rollout.detach() - logp.detach()).mean())
+    assert rollout.grad is None
+    assert vllm_kl is None and correction is None
+
+
+@pytest.mark.parametrize("threshold, expected_gradient", [(0.02, 0.0), (0.05, -1.5)])
+def test_dppo_threshold_controls_binary_kl_gate(threshold, expected_gradient):
+    logp = torch.tensor([[math.log(0.3)]], requires_grad=True)
+    loss, *_ = PolicyLoss(loss_mode="dppo", dppo_kl_threshold=threshold)(
+        logp,
+        logp.detach(),
+        torch.ones_like(logp),
+        action_mask=torch.ones_like(logp, dtype=torch.bool),
+        rollout_log_probs=torch.tensor([[math.log(0.2)]]),
+    )
+    loss.backward()
+    torch.testing.assert_close(logp.grad, torch.tensor([[expected_gradient]]))
+
+
+def test_dppo_mask_preserves_global_token_denominator_and_ignores_padding():
+    logp = torch.tensor([[math.log(0.8), math.log(0.3), float("-inf")]], requires_grad=True)
+    loss, _, blocked, *_ = PolicyLoss(loss_mode="dppo")(
+        logp,
+        logp.detach(),
+        torch.ones_like(logp),
+        action_mask=torch.tensor([[True, True, False]]),
+        rollout_log_probs=torch.tensor([[math.log(0.2), math.log(0.2), float("nan")]]),
+        batch_num_tokens=20,
+        dp_size=2,
+    )
+    loss.backward()
+    torch.testing.assert_close(logp.grad, torch.tensor([[0.0, -0.15, 0.0]]))
+    torch.testing.assert_close(blocked, torch.tensor(0.5))
+
+
+def test_dppo_handles_probabilities_rounded_to_zero_or_one():
+    logp = torch.tensor([[0.0, -100.0, -0.1, -100.0]], requires_grad=True)
+    loss, _, blocked, *_ = PolicyLoss(loss_mode="dppo")(
+        logp,
+        logp.detach(),
+        torch.tensor([[1.0, -1.0, 1.0, 0.0]]),
+        action_mask=torch.ones_like(logp, dtype=torch.bool),
+        rollout_log_probs=torch.tensor([[-0.1, -0.1, 0.0, -100.0]]),
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(logp.grad).all()
+    torch.testing.assert_close(blocked, torch.tensor(0.5))
+
+
+@pytest.mark.parametrize("threshold", [0, -0.1, float("nan"), float("inf")])
+def test_dppo_rejects_invalid_threshold(threshold):
+    with pytest.raises(ValueError, match="finite and positive"):
+        PolicyLoss(loss_mode="dppo", dppo_kl_threshold=threshold)
+
+
+@pytest.mark.parametrize("level", ["token", "seq", "geo"])
+def test_dppo_rejects_duplicate_importance_correction(level):
+    with pytest.raises(ValueError, match="already uses the rollout importance ratio"):
+        PolicyLoss(loss_mode="dppo", is_correction_level=level)
+
+
+def test_dppo_requires_rollout_probabilities():
+    with pytest.raises(ValueError, match="rollout_log_probs is required for DPPO"):
+        PolicyLoss(loss_mode="dppo")(torch.zeros(1, 1), torch.zeros(1, 1), torch.ones(1, 1))

@@ -112,6 +112,8 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
         session_base_dir=str(session_base_dir) if session_base_dir else None,
         rollout_server_url=topology.gateway.rollout_server_url or None,
         heartbeat_interval_seconds=topology.gateway.heartbeat_interval_seconds,
+        postrun_grace_seconds=topology.gateway.postrun_grace_seconds,
+        timeout_reward=topology.gateway.timeout_reward,
     )
     return GatewayState(
         topology=topology,
@@ -395,10 +397,10 @@ async def inference_generation_status():
 
 
 @app.post("/admin/inference/pause")
-async def pause_inference_generation(timeout_seconds: float = 300.0):
+async def pause_inference_generation(timeout_seconds: float = 300.0, drain: bool = True):
     state = get_state()
     try:
-        status = await state.inference.pause_generation(timeout_seconds=timeout_seconds)
+        status = await state.inference.pause_generation(timeout_seconds=timeout_seconds, drain=drain)
     except TimeoutError as exc:
         raise HTTPException(
             status_code=504,

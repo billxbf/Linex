@@ -62,6 +62,39 @@ def test_corrected_partial_rollout_passes_cli_gate():
     assert "Per-token IS is correcting those off-policy tokens" in result.stdout
 
 
+def test_dppo_corrects_async_partial_rollout_without_separate_is():
+    result = _run_cli(
+        "--actor.loss_mode",
+        "dppo",
+        "--algo.advantage.estimator",
+        "grpo",
+        "--rollout.n_samples_per_prompt",
+        "8",
+        "--train.async_queue_size",
+        "2",
+        "--train.partial_rollout_enable",
+        "--train.force_on_policy",
+    )
+    assert "pipeline-parallel" in result.stderr
+    assert "Set --algo.advantage.is_correction_level" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "arguments, message",
+    [
+        (("--algo.advantage.is_correction_level", "token"), "already corrects rollout probabilities"),
+        (("--actor.dppo_kl_threshold", "0"), "finite and positive"),
+        (("--actor.dppo_kl_threshold", "nan"), "finite and positive"),
+        (("--actor.dual_clip", "3"), "PPO-only"),
+        (("--rollout.top_p", "0.9"), "use --rollout.top_p 1.0"),
+    ],
+)
+def test_dppo_rejects_incompatible_configuration(arguments, message):
+    result = _run_cli("--actor.loss_mode", "dppo", *arguments)
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
 def test_vlm_passes_the_polar_cli_gate():
     result = _run_cli(
         "--data.max_images_per_prompt",
@@ -109,6 +142,8 @@ def test_ray_runtime_env_forwards_wandb_settings(monkeypatch):
         "WANDB_API_KEY": "test-api-key",
         "WANDB_ENTITY": "test-entity",
         "WANDB_MODE": "offline",
+        "WANDB_RUN_ID": "persistent-run",
+        "WANDB_RESUME": "allow",
     }
     for name, value in expected.items():
         monkeypatch.setenv(name, value)
@@ -207,6 +242,7 @@ def test_polar_gateways_wrap_vllm_weight_update(monkeypatch):
     )
     actor.polar_gateways = [gateway]
     actor._gateway_pause_timeout = 90.0
+    actor._refit_drain = False
     actor.vllm_engines = []
     actor._prefix_caching_enabled = True
 
@@ -226,8 +262,8 @@ def test_polar_gateways_wrap_vllm_weight_update(monkeypatch):
 
     assert events == [
         "lock_acquire",
-        ("gateway_pause", 90.0),
         "pause_generation",
+        ("gateway_pause", 90.0, False),
         "broadcast",
         "reset_prefix_cache",
         "resume_generation",
@@ -254,3 +290,43 @@ def test_training_stops_at_computed_max_steps():
     actor.fit(global_step=10)
 
     assert released == [10]
+
+
+@pytest.mark.parametrize("max_steps,start,expected", [(2, 0, 2), (312, 0, 3), (12, 11, 12)])
+def test_training_limit_and_dataset_end_save_resumable_final_state(monkeypatch, max_steps, start, expected):
+    from molt.trainer import rl_trainer
+
+    metadata = getattr(rl_trainer.TrainingActor, "__ray_metadata__", None)
+    actor_class = metadata.modified_class if metadata else rl_trainer.TrainingActor
+    actor = object.__new__(actor_class)
+    payloads = iter([
+        ("samples", {"data_loader_state_dict": {"position": i}}, {}, 0.0, 0.0)
+        for i in range(3)
+    ] + ["done"])
+    actor.rollout_queue = types.SimpleNamespace(get=lambda **_kwargs: next(payloads))
+    actor.rollout_slots = types.SimpleNamespace(put=lambda *_args, **_kwargs: None)
+    actor.max_steps = max_steps
+    actor.args = types.SimpleNamespace(
+        train=types.SimpleNamespace(force_sync_mode=False), ckpt=types.SimpleNamespace(save_steps=25)
+    )
+    actor.wandb_logger = actor.tensorboard_logger = actor.critic_model_group = None
+    history = [0.125] * min(start, 8)
+    actor.restore_best_metric_tracker({"reward_history": history})
+    actor.train_step = lambda samples, step: ({"rollout/reward_mean": 0.25}, step + 1)
+    logged = []
+    actor.save_logs_and_checkpoints = lambda step, status, state: logged.append((step, dict(status)))
+    saves = []
+    actor.actor_model_group = types.SimpleNamespace(async_run_method=lambda **kwargs: saves.append(kwargs) or [])
+    monkeypatch.setattr(rl_trainer.ray, "get", lambda refs: None)
+
+    actor.fit(global_step=start)
+
+    assert len(saves) == 1
+    assert saves[0]["tag"] == f"global_step{expected}"
+    assert saves[0]["client_states"]["global_step"] == expected
+    assert saves[0]["client_states"]["data_loader_state_dict"] == {"position": expected - start - 1}
+    assert saves[0]["client_states"]["reward_history"] == (history + [0.25] * (expected - start))[-8:]
+    if expected == 12:
+        assert logged[-1][1]["rollout/reward_ma8"] == (7 * 0.125 + 0.25) / 8
+    else:
+        assert all("rollout/reward_ma8" not in status for _, status in logged)

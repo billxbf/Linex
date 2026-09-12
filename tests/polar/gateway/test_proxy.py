@@ -175,3 +175,34 @@ def test_generation_status_has_no_backend_selector() -> None:
 
     assert paused == {"paused": True, "inflight": 0, "base_url": "http://router:9000"}
     assert resumed == {"paused": False, "inflight": 0, "base_url": "http://router:9000"}
+
+
+def test_pause_generation_without_drain_parks_new_turns_but_returns_immediately() -> None:
+    client = InferenceClient("http://router:9000/")
+
+    async def run() -> tuple[dict, bool, dict]:
+        await client._acquire_generation_slot()  # one completion in flight at push time
+        paused = await asyncio.wait_for(client.pause_generation(drain=False), timeout=1.0)
+        new_turn = asyncio.create_task(client._acquire_generation_slot())
+        await asyncio.sleep(0.05)
+        blocked = not new_turn.done()
+        await client.resume_generation()
+        await asyncio.wait_for(new_turn, timeout=1.0)
+        return paused, blocked, client.generation_status()
+
+    paused, blocked, after = asyncio.run(run())
+
+    assert paused["paused"] is True and paused["inflight"] == 1
+    assert blocked, "a new turn must wait while generation is paused"
+    assert after["paused"] is False and after["inflight"] == 2
+
+
+def test_pause_generation_with_drain_waits_for_inflight_completions() -> None:
+    client = InferenceClient("http://router:9000/")
+
+    async def run() -> None:
+        await client._acquire_generation_slot()
+        await client.pause_generation(timeout_seconds=0.05, drain=True)
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(run())

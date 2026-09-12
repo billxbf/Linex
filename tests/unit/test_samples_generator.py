@@ -129,6 +129,27 @@ def test_generate_samples_emits_short_batch_when_dataloader_exhausted(monkeypatc
     assert generator._inflight_rollouts == []
 
 
+@pytest.mark.parametrize("force_on_policy", [False, True])
+def test_generate_samples_drains_last_inflight_groups_before_next_episode(monkeypatch, force_on_policy):
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(
+        rollout=SimpleNamespace(batch_size=3, n_samples_per_prompt=1, vllm_generate_batch_size=5),
+        algo=SimpleNamespace(dynamic_filtering_enable=False),
+        ckpt=SimpleNamespace(warm_resume_rollouts=False),
+        train=SimpleNamespace(force_on_policy=force_on_policy),
+    )
+    generator.prompts_dataloader = _prompt_loader(10)
+    _wire_fake_vllm(generator, monkeypatch, _sample)
+    seen = []
+    for _ in range(4):
+        samples, metrics, _, exhausted = generator.generate_samples()
+        seen.extend(sample.group_ids[0] for sample in samples)
+    assert exhausted
+    assert seen == [f"p{i}" for i in range(9 if force_on_policy else 10)]
+    if force_on_policy:
+        assert metrics["rollout/dropped/incomplete_batch"] == 1
+
+
 def _wire_eval_generator(generator, monkeypatch, num_prompts):
     generator.eval_dataloader = _prompt_loader(num_prompts)
     dispatch_sizes = []

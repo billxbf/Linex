@@ -63,8 +63,12 @@ class GatewayNodeManager:
         session_base_dir: str | None = None,
         rollout_server_url: str | None = None,
         heartbeat_interval_seconds: int = 30,
+        postrun_grace_seconds: float = 300.0,
+        timeout_reward: float | None = 0.0,
     ) -> None:
         self.node_id = node_id
+        self.postrun_grace_seconds = postrun_grace_seconds
+        self.timeout_reward = timeout_reward
         self.gateway_url = gateway_url.rstrip("/")
         self.max_init_workers = max_init_workers
         self.max_run_workers = max_run_workers
@@ -503,6 +507,7 @@ class GatewayNodeManager:
                 if managed.cancel_requested:
                     result = self._cancelled_result(request, managed.timer)
                 else:
+                    self._grant_postrun_budget(managed)
                     result = await self._build_session_result(managed)
         except GatewayExecutionTimeout as exc:
             result = self._timeout_result(request, managed.timer, str(exc))
@@ -567,6 +572,12 @@ class GatewayNodeManager:
                 "session did not produce an agent result",
             )
 
+        timed_out = agent_result.status == "timeout"
+        if timed_out and self.timeout_reward is None:
+            return self._timeout_result(
+                request, managed.timer, agent_result.error or "session execution timeout"
+            )
+
         self.session_registry.set_status(request.session_id, SessionStatus.BUILDING)
         managed.timer.mark("build", "started")
         try:
@@ -574,13 +585,29 @@ class GatewayNodeManager:
                 asyncio.to_thread(self._build_trajectory, request),
                 managed,
             )
+        except GatewayExecutionTimeout:
+            raise
+        except Exception as exc:
+            if not timed_out:
+                raise
+            # A session killed mid-turn can leave completions the builder rejects; the sample is
+            # lost either way, but the session must still report as a timeout, not a build error.
+            logger.warning(
+                "Trajectory build failed for timed-out session %s: %s", request.session_id, exc
+            )
+            return self._timeout_result(
+                request, managed.timer, f"{agent_result.error}; trajectory build failed: {exc}"
+            )
         finally:
             managed.timer.mark("build", "finished")
 
         error = trajectory.error
-        if agent_result.status == "timeout":
-            trajectory = trajectory.model_copy(
-                update={"status": "TIMEOUT", "error": agent_result.error or error}
+        if timed_out:
+            # The budget is the task: a session that ran out of time failed it. Its partial
+            # trajectory trains with timeout_reward; the evaluator is not run on the half-edited
+            # workspace, so the whole postrun is a build, not a verifier run.
+            trajectory = self._apply_timeout_reward(
+                trajectory, self.timeout_reward, agent_result.error or error
             )
         elif agent_result.status == "failed":
             trajectory = trajectory.model_copy(
@@ -589,7 +616,7 @@ class GatewayNodeManager:
 
         managed.timer.mark("eval", "started")
         try:
-            if request.evaluator is not None:
+            if request.evaluator is not None and not timed_out:
                 self.session_registry.set_status(request.session_id, SessionStatus.EVALUATING)
                 trajectory = await self._run_eval(
                     request,
@@ -600,7 +627,9 @@ class GatewayNodeManager:
         except GatewayExecutionTimeout as exc:
             # Preserve the built trajectory even when eval times out.
             logger.warning("Eval timed out for session %s: %s", request.session_id, exc)
-            if trajectory.status not in ("TIMEOUT", "ERROR"):
+            if self.timeout_reward is not None:
+                trajectory = self._apply_timeout_reward(trajectory, self.timeout_reward, f"eval timed out: {exc}")
+            elif trajectory.status not in ("TIMEOUT", "ERROR"):
                 trajectory = trajectory.model_copy(
                     update={"status": "TIMEOUT", "error": f"eval timed out: {exc}"}
                 )
@@ -667,34 +696,24 @@ class GatewayNodeManager:
             config=evaluator_spec.config,
         )
 
-        try:
-            evaluator = self.evaluators.create(strategy_spec)
-            eval_result = await self._await_with_budget(
-                evaluator.evaluate(
-                    trajectory,
-                    session_id=request.session_id,
-                    task_id=request.task_id,
-                    session_dir=managed.session_dir,
-                    artifacts_dir=managed.artifacts_dir,
-                    agent_result=agent_result,
-                    env=dict(evaluator_spec.env),
-                    timeout_seconds=self._remaining_budget(managed),
-                    runtime=live_runtime,
-                    fresh_eval_runtime=fresh_eval_runtime,
-                    runtime_spec=request.runtime or self.default_runtime,
-                    refresh_runtime=evaluator_spec.refresh_runtime,
-                ),
-                managed,
-            )
-        except Exception as exc:
-            logger.exception(
-                "Evaluator %s failed for session %s",
-                evaluator_spec.strategy,
-                request.session_id,
-            )
-            return trajectory.model_copy(
-                update={"status": "ERROR", "error": f"evaluator failed: {exc}"}
-            )
+        evaluator = self.evaluators.create(strategy_spec)
+        eval_result = await self._await_with_budget(
+            evaluator.evaluate(
+                trajectory,
+                session_id=request.session_id,
+                task_id=request.task_id,
+                session_dir=managed.session_dir,
+                artifacts_dir=managed.artifacts_dir,
+                agent_result=agent_result,
+                env=dict(evaluator_spec.env),
+                timeout_seconds=self._remaining_budget(managed),
+                runtime=live_runtime,
+                fresh_eval_runtime=fresh_eval_runtime,
+                runtime_spec=request.runtime or self.default_runtime,
+                refresh_runtime=evaluator_spec.refresh_runtime,
+            ),
+            managed,
+        )
 
         return self._merge_eval_result(trajectory, eval_result, evaluator_spec)
 
@@ -850,6 +869,19 @@ class GatewayNodeManager:
             metadata=dict(request.metadata),
         )
 
+    @staticmethod
+    def _apply_timeout_reward(trajectory: Trajectory, reward: float, error: str | None) -> Trajectory:
+        traces = [trace.model_copy(update={"reward": reward}) for trace in trajectory.traces]
+        evaluation = {"strategy": "timeout_reward", "outcome_reward": reward, "trace_rewards": None}
+        return trajectory.model_copy(
+            update={
+                "status": "TIMEOUT",
+                "error": error,
+                "traces": traces,
+                "metadata": {**trajectory.metadata, "evaluation": evaluation},
+            }
+        )
+
     def _cancelled_result(self, request: SessionDispatchRequest, timer: StageTimer) -> SessionResult:
         return self._error_result(request, timer, "session cancelled")
 
@@ -902,6 +934,17 @@ class GatewayNodeManager:
             )
         except asyncio.TimeoutError as exc:
             raise GatewayExecutionTimeout("session execution timeout") from exc
+
+    def _grant_postrun_budget(self, managed: ManagedSession) -> None:
+        """Give build + eval at least postrun_grace_seconds, however the agent phase spent its budget.
+
+        The agent phase and the postrun shared one deadline, so a timed-out session reached
+        _build_session_result with nothing left and _remaining_budget raised before the trajectory
+        was built: no traces, no evaluation, sample dropped, though its completions were on disk.
+        """
+        floor = asyncio.get_running_loop().time() + self.postrun_grace_seconds
+        if managed.execution_deadline is None or managed.execution_deadline < floor:
+            managed.execution_deadline = floor
 
     @staticmethod
     def _start_execution_deadline(managed: ManagedSession) -> None:

@@ -197,15 +197,24 @@ class InferenceClient:
             self._inflight_generations -= 1
             self._generation_condition.notify_all()
 
-    async def pause_generation(self, *, timeout_seconds: float = 300.0) -> dict[str, Any]:
-        """Block new generation requests and wait for current inference calls to drain."""
+    async def pause_generation(
+        self, *, timeout_seconds: float = 300.0, drain: bool = True
+    ) -> dict[str, Any]:
+        """Block new generation requests; with ``drain`` also wait for in-flight calls to finish.
+
+        ``drain=False`` is for engines that freeze their scheduler themselves (vLLM
+        ``pause_generation(mode="keep")``): the in-flight completions stay parked inside the
+        engine across the weight update instead of running to their natural end first, which
+        with agentic turns of up to 16k tokens otherwise idles every engine for minutes.
+        """
         async with self._generation_condition:
             self._generation_paused = True
             self._generation_condition.notify_all()
-            await asyncio.wait_for(
-                self._generation_condition.wait_for(lambda: self._inflight_generations == 0),
-                timeout=timeout_seconds,
-            )
+            if drain:
+                await asyncio.wait_for(
+                    self._generation_condition.wait_for(lambda: self._inflight_generations == 0),
+                    timeout=timeout_seconds,
+                )
             return self.generation_status()
 
     async def resume_generation(self) -> dict[str, Any]:

@@ -94,11 +94,9 @@ class RemoteExperienceMaker:
         if self.initial_model_group is not None:
             self._dispatch_forward(experiences, self.initial_model_group, "base_action_log_probs")
 
-        # Old actor log-probs. Force-on-policy with no KL reward (kl_coef==0): old == the training
-        # forward, so the PPO ratio is 1 (REINFORCE) and policy_train recomputes old itself — skip
-        # the redundant pass. Otherwise (off-policy, or a KL reward that compares old vs the
-        # ref) run the actor forward here.
-        skip_actor_old = args.train.force_on_policy and args.algo.kl.init_coef == 0
+        # DPPO uses stored rollout probabilities; a single-update PPO batch uses its training
+        # forward. Neither needs an old-policy pass unless KL rewards consume those log-probs.
+        skip_actor_old = args.algo.kl.init_coef == 0 and (args.train.force_on_policy or args.actor.loss_mode == "dppo")
         if not skip_actor_old:
             self._dispatch_forward(experiences, self.actor_model_group, "action_log_probs")
 

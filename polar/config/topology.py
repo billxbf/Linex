@@ -81,6 +81,14 @@ class _CompletionPersistenceConfig(_StrictModel):
 class GatewayConfig(_StrictModel):
     heartbeat_interval_seconds: int = Field(default=30, gt=0)
     rollout_server_url: str | None = None
+    # Budget granted to trajectory build and evaluation once the agent phase ends, so a session
+    # that spent its whole timeout in the agent still gets its partial trajectory built (and a
+    # session that finished with seconds to spare still gets a real evaluation window). The
+    # rollout server's callback_grace_seconds must cover it.
+    postrun_grace_seconds: float = Field(default=300.0, ge=0)
+    # Reward for sessions that hit the session timeout: their partial trajectory is trained as a
+    # failure. None restores the old behaviour (no trajectory, the sample is dropped).
+    timeout_reward: float | None = 0.0
     nodes: tuple[GatewayNodeConfig, ...] = Field(min_length=1)
     completion_persistence: _CompletionPersistenceConfig = Field(
         default_factory=_CompletionPersistenceConfig

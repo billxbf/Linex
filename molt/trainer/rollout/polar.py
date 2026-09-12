@@ -99,12 +99,12 @@ class PolarServiceActor:
         result = await get_state().manager.run_task(request)
         return result.model_dump(mode="json")
 
-    async def pause(self, timeout_seconds: float = 300.0) -> dict:
+    async def pause(self, timeout_seconds: float = 300.0, drain: bool = True) -> dict:
         if self.service != "gateway":
             raise RuntimeError("pause is only available on gateways")
         from polar.gateway.server import get_state
 
-        return await get_state().inference.pause_generation(timeout_seconds=timeout_seconds)
+        return await get_state().inference.pause_generation(timeout_seconds=timeout_seconds, drain=drain)
 
     async def resume(self) -> dict:
         if self.service != "gateway":

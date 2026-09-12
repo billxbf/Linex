@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import molt.trainer.algorithm.experience as experience_mod
@@ -25,6 +26,32 @@ from molt.trainer.algorithm.experience import (
     make_experience_batch,
 )
 from molt.trainer.rollout.experience_maker import RemoteExperienceMaker
+
+
+@pytest.mark.parametrize(
+    "loss_mode, force_on_policy, kl_coef, expected_calls",
+    [("dppo", False, 0.0, 0), ("ppo", True, 0.0, 0), ("ppo", False, 0.0, 1), ("dppo", False, 0.1, 1)],
+)
+def test_old_policy_forward_is_skipped_when_the_objective_does_not_need_it(
+    loss_mode, force_on_policy, kl_coef, expected_calls
+):
+    calls = []
+    maker = SimpleNamespace(
+        args=SimpleNamespace(
+            train=SimpleNamespace(force_on_policy=force_on_policy),
+            actor=SimpleNamespace(loss_mode=loss_mode),
+            algo=SimpleNamespace(kl=SimpleNamespace(init_coef=kl_coef, use_loss=False)),
+        ),
+        critic_model_group=None,
+        initial_model_group=None,
+        actor_model_group=object(),
+        _dispatch_forward=lambda *args: calls.append(args),
+    )
+    exp = Experience(action_mask=torch.ones(1, 2, dtype=torch.bool), info={})
+    RemoteExperienceMaker.make_experience(maker, [exp])
+    assert len(calls) == expected_calls
+    if calls:
+        assert calls[0][2] == "action_log_probs"
 
 
 def _args(cp=1, tp=1, ep=1, actor_gpus=1):
@@ -118,6 +145,35 @@ def test_distributed_advantages_match_materialized():
     for i in range(8):
         assert torch.allclose(per_sample[i].advantages[0], concat.advantages[i])
         assert torch.allclose(per_sample[i].returns[0], concat.returns[i])
+
+
+def test_grpo_g8_dppo_counts_split_rollouts_once():
+    from molt.models import PolicyLoss
+
+    samples = [_sample(i, "prompt", float(i == 0)) for i in range(8)]
+    samples[0] = _sample(0, "prompt", 1.0, length=2)
+    samples.insert(1, _sample(0, "prompt", 1.0, length=4))
+    maker = _grpo_maker()
+    maker.args.rollout.n_samples_per_prompt = 8
+    maker.compute_advantages_and_returns(samples)
+    token_count = sum(s.action_mask.sum() for s in samples)
+    loss_fn = PolicyLoss(loss_mode="dppo")
+    for sample in samples:
+        success = sample.rewards.item() == 1.0
+        expected_advantage = (0.875 if success else -0.125) / (0.125**0.5)
+        torch.testing.assert_close(sample.advantages, torch.full_like(sample.advantages, expected_advantage))
+        q = 0.3 if success else 0.25
+        logp = torch.full_like(sample.advantages, q).log().requires_grad_()
+        loss, *_ = loss_fn(
+            logp,
+            logp.detach(),
+            sample.advantages,
+            action_mask=sample.action_mask,
+            rollout_log_probs=torch.full_like(logp, 0.2).log(),
+            batch_num_tokens=token_count,
+        )
+        loss.backward()
+        torch.testing.assert_close(logp.grad, -sample.advantages * (q / 0.2) / token_count)
 
 
 def test_experience_offload_reload_roundtrip(monkeypatch):

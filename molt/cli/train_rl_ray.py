@@ -55,6 +55,8 @@ def _ray_runtime_env_vars():
         "WANDB_API_KEY",
         "WANDB_ENTITY",
         "WANDB_MODE",
+        "WANDB_RUN_ID",
+        "WANDB_RESUME",
     ):
         if os.environ.get(name):
             env_vars[name] = os.environ[name]
@@ -184,9 +186,14 @@ def train(args):
                     "port": rollout_node["port"],
                     "public_url": rollout_node["url"],
                     "save_dir": str(Path(args.rollout.save_dir).resolve()),
+                    # The rollout server gives up on a session this long after its timeout; it
+                    # must outlast the gateway's postrun grace or it deletes the session mid-build.
+                    "callback_grace_seconds": args.rollout.postrun_grace + 120.0,
                 },
                 "gateway": {
                     "rollout_server_url": rollout_node["url"],
+                    "postrun_grace_seconds": args.rollout.postrun_grace,
+                    "timeout_reward": None if args.rollout.drop_timeouts else args.rollout.timeout_reward,
                     "nodes": [
                         {
                             "id": node["node_id"],
@@ -501,6 +508,15 @@ if __name__ == "__main__":
     parser.add_argument("--data.prompt_split", type=str, default="train")
     parser.add_argument("--data.max_samples", type=int, default=int(1e8), help="Max number of samples")
     parser.add_argument("--data.max_len", type=int, default=2048, help="Max total sequence length (prompt + response)")
+    parser.add_argument(
+        "--data.train_max_len",
+        type=int,
+        default=None,
+        help="Truncate each trajectory to this many tokens for TRAINING only; the rollout / vLLM context "
+        "stays --data.max_len. Unset keeps the full length. Caps the per-microbatch backward memory at long "
+        "context on few GPUs (a single full-length trajectory is one indivisible microbatch); pair with a "
+        "matching --train.max_tokens_per_gpu so multi-sample microbatches stay under the same bound.",
+    )
     parser.add_argument("--data.input_key", type=str, default="input", help="JSON dataset key")
     parser.add_argument(
         "--data.task_key",
@@ -620,7 +636,7 @@ if __name__ == "__main__":
         "--actor.loss_mode",
         type=str,
         default="ppo",
-        choices=["ppo", "cispo", "gspo"],
+        choices=["ppo", "cispo", "gspo", "dppo"],
         help="Policy-gradient surrogate: ppo (clipped min(surr1,surr2), optionally --actor.dual_clip) or "
         "cispo (https://arxiv.org/abs/2506.13585 — clips only the upper side of the IS ratio, "
         "stop-gradient through that weight, gradient flows through log-probs only; pass "
@@ -628,7 +644,15 @@ if __name__ == "__main__":
         "--actor.dual_clip is unused in this mode) or "
         "gspo (https://arxiv.org/abs/2507.18071 — clips ONE ratio per sequence, its geometric mean, "
         "so a single outlier token cannot clip the whole update; aggregated with molt's global "
-        "token-mean denominator, not the paper's per-sequence 1/|y|; --actor.dual_clip is unused).",
+        "token-mean denominator, not the paper's per-sequence 1/|y|; --actor.dual_clip is unused) or "
+        "dppo (rollout-anchored binary-KL directional mask; --actor.dppo_kl_threshold controls the region).",
+    )
+    parser.add_argument(
+        "--actor.dppo_kl_threshold",
+        type=float,
+        default=0.05,
+        help="Binary KL threshold for DPPO; requires a finite positive value. "
+        "DPPO uses rollout probabilities directly, without a separate IS correction or ratio cap.",
     )
     parser.add_argument(
         "--actor.entropy_coef",
@@ -846,6 +870,33 @@ if __name__ == "__main__":
         help="End-to-end timeout in seconds for each Polar session",
     )
     parser.add_argument(
+        "--rollout.timeout_reward",
+        type=float,
+        default=0.0,
+        help="Reward for sessions that hit --rollout.session_timeout: the gateway builds their partial "
+        "trajectory and it trains as a failure. See --rollout.drop_timeouts for the old behaviour.",
+    )
+    parser.add_argument(
+        "--rollout.drop_timeouts",
+        action="store_true",
+        help="Drop timed-out sessions (no trajectory, no sample) instead of training them with "
+        "--rollout.timeout_reward",
+    )
+    parser.add_argument(
+        "--rollout.postrun_grace",
+        type=float,
+        default=300.0,
+        help="Seconds the gateway grants trajectory build and evaluation after the agent phase, "
+        "independent of what the agent left of the session budget",
+    )
+    parser.add_argument(
+        "--rollout.refit_drain",
+        action="store_true",
+        help="Before each weight push, wait for the gateways' in-flight completions to finish (old "
+        "behaviour). Default: freeze them in the engines (vLLM pause mode keep) and re-prefill them "
+        "under the new weights on resume.",
+    )
+    parser.add_argument(
         "--rollout.save_dir",
         type=str,
         default="./rollout_results",
@@ -915,6 +966,10 @@ if __name__ == "__main__":
         help="Colocate the FSDP models (actor, reference, critic) on the actor's GPUs (they time-slice the same GPUs).",
     )
     parser.add_argument("--train.async_queue_size", type=int, default=1, help="Queue size for async sampler<->trainer")
+    parser.add_argument(
+        "--train.max_steps", type=int, default=None,
+        help="Stop at this global update for a resumable smoke run; keep the full dataset.",
+    )
     parser.add_argument(
         "--train.partial_rollout_enable",
         action="store_true",
@@ -1075,7 +1130,17 @@ if __name__ == "__main__":
             "n_samples_per_prompt must be greater than 1 when using dynamic filtering"
         )
 
-    if args.algo.advantage.is_correction_level == "off":
+    if args.actor.loss_mode == "dppo":
+        if not 0 < args.actor.dppo_kl_threshold < float("inf"):
+            raise ValueError("--actor.dppo_kl_threshold must be finite and positive")
+        if args.algo.advantage.is_correction_level != "off":
+            raise ValueError(
+                "DPPO already corrects rollout probabilities; set --algo.advantage.is_correction_level off"
+            )
+        if args.actor.dual_clip is not None:
+            raise ValueError("--actor.dual_clip is PPO-only and cannot be used with DPPO")
+
+    if args.algo.advantage.is_correction_level == "off" and args.actor.loss_mode != "dppo":
         # The HTTP path has no per-token policy-boundary mask. Async and partial
         # rollout can cross broadcasts between requests, so require IS correction.
         if args.train.async_queue_size > 1 or args.train.partial_rollout_enable:
@@ -1099,13 +1164,15 @@ if __name__ == "__main__":
             "Per-token IS is correcting those off-policy tokens."
         )
 
-    if args.algo.advantage.is_correction_level != "off" and args.rollout.top_p < 1.0:
+    if (
+        args.algo.advantage.is_correction_level != "off" or args.actor.loss_mode == "dppo"
+    ) and args.rollout.top_p < 1.0:
         # vLLM computes `processed_logprobs` AFTER the top-p mask, so they are renormalized over the
         # kept nucleus while training recomputes over the full vocabulary. Every rollout log-prob is
         # then offset by -log(kept mass), biasing vllm_kl and the IS ratio on every token.
         raise ValueError(
-            f"--rollout.top_p {args.rollout.top_p} biases the rollout log-probs the IS correction "
-            "consumes; use --rollout.top_p 1.0, or --algo.advantage.is_correction_level off."
+            f"--rollout.top_p {args.rollout.top_p} biases the rollout log-probs used by importance "
+            "correction (including DPPO); use --rollout.top_p 1.0."
         )
 
     # --- Data ---

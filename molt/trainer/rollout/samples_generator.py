@@ -78,6 +78,7 @@ class SamplesGenerator:
     ):
         self.strategy = strategy
         self.args = strategy.args
+        self._train_max_len = getattr(strategy.args.data, "train_max_len", None)
 
         self.tokenizer = tokenizer
         self.polar_rollout = polar_rollout
@@ -189,7 +190,7 @@ class SamplesGenerator:
         a weight refit pauses/resumes the engines (see broadcast_to_vllm), so the
         in-flight rollouts survive it.
         """
-        if getattr(self, "_dataloader_iter", None) is None:
+        if not hasattr(self, "_dataloader_iter"):
             self._dataloader_iter = iter(self.prompts_dataloader)
             # Seed from a warm-resume buffer if load_state_dict restored one, so the first
             # post-resume batch ships without waiting for a full fresh generation. Consumed once.
@@ -282,6 +283,12 @@ class SamplesGenerator:
 
         # Exhausted only once the dataloader is done AND nothing is buffered or in flight.
         exhausted = self._dataloader_iter is None and not self._finished_samples and not self._inflight_rollouts
+        if exhausted:
+            del self._dataloader_iter
+            if len(selected_groups) < groups_per_batch and getattr(getattr(self.args, "train", None), "force_on_policy", False):
+                logger.info("Skipping final incomplete batch: %s of %s prompt groups", len(selected_groups), groups_per_batch)
+                rollout_metrics["rollout/dropped/incomplete_batch"] = float(len(batch_samples))
+                batch_samples = []
         return batch_samples, rollout_metrics, prompts_dispatched, exhausted
 
     def _passes_dynamic_filter(self, rollout_samples) -> bool:
@@ -445,9 +452,13 @@ class SamplesGenerator:
                 full_sequence_ids = trace.prompt_ids + trace.response_ids
                 full_token_mask = [0] * len(trace.prompt_ids) + trace.loss_mask
                 full_token_logprobs = [0.0] * len(trace.prompt_ids) + (trace.response_logprobs or [])
-                sequence_ids = full_sequence_ids[:max_length]
-                token_mask = full_token_mask[:max_length]
-                token_logprobs = full_token_logprobs[:max_length]
+                # Training-side truncation: a full-length trajectory is one indivisible microbatch, so
+                # its backward can overflow GPU memory at long context on few CP ranks. train_max_len caps
+                # the trainable length while the rollout itself still ran at the full --data.max_len budget.
+                train_max_length = min(max_length, getattr(self, "_train_max_len", None) or max_length)
+                sequence_ids = full_sequence_ids[:train_max_length]
+                token_mask = full_token_mask[:train_max_length]
+                token_logprobs = full_token_logprobs[:train_max_length]
 
                 known_media_ids = media_token_ids(self.tokenizer) if trace.media_paths else set()
                 if trace.media_paths and len(full_sequence_ids) > max_length:
@@ -503,12 +514,15 @@ class SamplesGenerator:
                 info = {
                     "reward": torch.tensor([reward]),
                     "score": torch.tensor([reward]),
-                    "response_clip_ratio": torch.tensor([len(sequence_ids) >= max_length]),
+                    "response_clip_ratio": torch.tensor([len(sequence_ids) >= train_max_length]),
                 }
                 if trace.media_paths:
                     info["image_tokens"] = torch.tensor([image_tokens])
                 for name, value in session.timing.model_dump().items():
                     info[f"polar/{name}"] = torch.tensor([value])
+                # Fraction of trained rows that came from sessions which hit the session budget
+                # (trained as failures with --rollout.timeout_reward), for the step metrics.
+                info["polar/timeout"] = torch.tensor([float(session.status == SessionStatus.TIMEOUT)])
 
                 converted.append(
                     (

@@ -102,6 +102,7 @@ class PolicyTrainer:
             clip_eps_high=self.args.actor.eps_clip_low_high[1],
             dual_clip=self.args.actor.dual_clip,
             loss_mode=self.args.actor.loss_mode,
+            dppo_kl_threshold=self.args.actor.dppo_kl_threshold,
             is_correction_level=self.args.algo.advantage.is_correction_level,
             is_correction_mode=self.args.algo.advantage.is_correction_mode,
             is_correction_threshold=(
@@ -373,14 +374,10 @@ class PolicyTrainer:
         # AutoModel CP train context must cover both forward and backward.
         cp_context_stack = ExitStack()
 
-        # Stage 2: forward actor. CP is only an implementation detail here:
-        # log-probs are restored to the dense token axis before losses run.
-        # The loss uses slime's global token-mean: batch_num_tokens is the action
-        # token count of the whole optimizer-step batch (all microbatches, all DP
-        # ranks), so FSDP's dp_cp reduce-scatter cannot bias gradients toward DP
-        # shards with fewer action tokens. The dp_size scale stays DP-only (CP
-        # ranks share the sample); the CP gradient compensation for FSDP's extra
-        # dp_cp averaging is applied in FsdpStrategy.backward (loss *= cp_size).
+        # CP log-probs are gathered to the full token axis before the loss. The
+        # denominator covers all microbatches and DP ranks; CP ranks share samples.
+        # The gather's summed backward cancels FSDP's averaging over CP, so loss
+        # scaling uses DP size alone, with no additional CP multiplier.
         loss_data_parallel_size = self.strategy.dp_size
         model_output = self.actor(
             sequences,
@@ -398,6 +395,11 @@ class PolicyTrainer:
             # The batch is trained for one on-policy step, so old == this forward -> PPO
             # ratio 1 -> REINFORCE gradient; the IS correction still runs vs rollout_log_probs.
             old_action_log_probs = action_log_probs.detach()
+
+        if rollout_log_probs is not None:
+            experience.info["rollout_abs_logratio"] = masked_mean(
+                (action_log_probs.detach().float() - rollout_log_probs.float()).abs(), action_mask
+            )
 
         # Debug observability: MOLT_DUMP_ROLLOUT_LOGPROBS=<path> dumps per-position
         # token_id / rollout(vLLM) logprob / actor recomputed logprob for the first

@@ -15,7 +15,8 @@ one and get configured in one place. CLI entry should still reuse Molt existing 
 ### Code Reference -- Molt and Polar
 
 The original upstream of Molt (reference/labs-molt) and Polar (reference/ProRL-Agent-Server)
-are cloned locally for read-only reference. Do not modify or treat them as dependency in 
+are cloned locally for read-only reference, together with well-established RL framework (reference/miles).
+Do not modify or treat them as dependency in 
 any way. They are put here to demonstrate the original implementation 
 of respective frameworks and to keep track of their latest changes.
 
