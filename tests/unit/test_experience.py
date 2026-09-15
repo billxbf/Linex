@@ -108,8 +108,6 @@ def _grpo_maker():
             rollout=SimpleNamespace(n_samples_per_prompt=4),
         ),
     )
-    # Bind the two instance methods the estimator path dispatches through (each reads only its args).
-    maker._merge_rollout_rewards = RemoteExperienceMaker._merge_rollout_rewards.__get__(maker)
     maker.compute_advantages_and_returns = RemoteExperienceMaker.compute_advantages_and_returns.__get__(maker)
     return maker
 
@@ -174,6 +172,45 @@ def test_grpo_g8_dppo_counts_split_rollouts_once():
         )
         loss.backward()
         torch.testing.assert_close(logp.grad, -sample.advantages * (q / 0.2) / token_count)
+
+
+@pytest.mark.parametrize("order", [(0, 1, 2), (2, 0, 1)])
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("estimator", ["grpo", "dr_grpo", "reinforce_baseline", "rloo"])
+def test_per_trace_advantages_use_rollout_equal_token_weighted_statistics(order, split, estimator):
+    samples = [_sample(0, "g", 1.2, length=1), _sample(0, "g", 0.8, length=4), _sample(1, "g", 0.0, length=2)]
+    samples[1].action_mask[0, 1] = False
+    samples = [samples[i] for i in order]
+    if split:
+        index = next(i for i, sample in enumerate(samples) if sample.action_mask.shape[-1] == 4)
+        samples[index:index + 1] = [_sample(0, "g", 0.8, length=1), _sample(0, "g", 0.8, length=2)]
+    maker = _grpo_maker()
+    maker.advantage_estimator = estimator
+    maker.compute_advantages_and_returns(samples)
+
+    # Rollout means are 0.9 and 0; variance includes both deviations within the first rollout.
+    for sample in samples:
+        expected = sample.rewards.item() - 0.45
+        if estimator == "grpo":
+            expected /= 0.435**0.5
+        elif estimator == "rloo":
+            expected = sample.rewards.item() if sample.rollout_ids == ["r0"] else -0.9
+        torch.testing.assert_close(sample.returns, expected * sample.action_mask.float())
+        torch.testing.assert_close(sample.info["group_reward_std"], torch.tensor([0.435**0.5]))
+
+
+def test_per_trace_grpo_retains_variation_when_rollout_means_match():
+    samples = [_sample(0, "g", 0.2), _sample(0, "g", 0.8), _sample(1, "g", 0.5)]
+    _grpo_maker().compute_advantages_and_returns(samples)
+    for sample, expected in zip(samples, [-1.0, 1.0, 0.0]):
+        torch.testing.assert_close(sample.advantages, torch.full_like(sample.advantages, expected))
+
+
+def test_constant_rewards_remain_zero_with_unequal_trace_lengths():
+    samples = [_sample(0, "g", 0.7, length=1), _sample(0, "g", 0.7, length=2), _sample(1, "g", 0.7)]
+    _grpo_maker().compute_advantages_and_returns(samples)
+    for sample in samples:
+        assert torch.count_nonzero(sample.advantages) == 0
 
 
 def test_experience_offload_reload_roundtrip(monkeypatch):

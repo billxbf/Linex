@@ -29,6 +29,7 @@ from molt.trainer.algorithm.advantage import (
     GROUP_ADVANTAGE_ESTIMATORS,
     AdvantageContext,
     get_advantage_estimator,
+    group_reward_moments,
 )
 from molt.trainer.algorithm.experience import Experience
 from molt.utils.logging_utils import init_logger
@@ -142,97 +143,40 @@ class RemoteExperienceMaker:
 
     # Advantage and return computation
 
-    def _merge_rollout_rewards(self, experiences: List[Experience]) -> dict:
-        """Preprocessing: merge a rollout's multi-turn step-samples into one reward per rollout.
-
-        Multi-turn agents emit several step-samples per rollout that share a rollout_id and the
-        same terminal reward. We keep one reward per rollout and record, for every sample, which
-        rollout it belongs to — so an estimator's per-rollout advantage can be scattered back to
-        all of its steps. Without ids (legacy path) each sample is its own rollout and prompt.
-
-        Example — two experiences, rollout "A" has 2 steps, "B" has 1, "C" has 2:
-            e0.rollout_ids = ["A", "A", "B"]   e1.rollout_ids = ["C", "C"]
-            e0.group_ids   = ["g0", "g0", "g0"]  e1.group_ids   = ["g1", "g1"]
-            e0.rewards     = [1.0, 1.0, 0.0]   e1.rewards     = [0.5, 0.5]
-        After concat the 5 samples are [A, A, B, C, C]; merging by first-seen rollout_id gives
-            rewards           = [1.0, 0.0, 0.5]   # (R=3) one per unique rollout A, B, C
-            groups            = [[0, 1], [2]]     # rollout rows grouped by prompt (g0, g1)
-            sample_to_rollout = [0, 0, 1, 2, 2]   # (S=5) sample i -> its rollout's row in `rewards`
-            exp_len           = [3, 2]            # samples per experience, to re-split later
-        """
-        exp_len = [len(e.index) for e in experiences]
-        ids = [rollout_and_group_ids(e) for e in experiences]
-        rollout_ids = list(itertools.chain.from_iterable(r for r, _ in ids))
-        group_ids = list(itertools.chain.from_iterable(g for _, g in ids))
-        rewards = torch.cat([e.rewards for e in experiences], dim=0)
-        if not (len(rollout_ids) == len(group_ids) == rewards.numel()):
-            raise ValueError(
-                f"id/reward length mismatch: {len(rollout_ids)} rollout_ids, "
-                f"{len(group_ids)} group_ids, {rewards.numel()} rewards"
-            )
-
-        rollout_rewards: list = []
-        sample_to_rollout: list = []
-        prompt_groups: dict = {}  # prompt id -> rollout rows (preserves first-seen order)
-        first_seen: dict = {}
-        for rid, gid, reward in zip(rollout_ids, group_ids, rewards):
-            if rid not in first_seen:
-                first_seen[rid] = len(rollout_rewards)
-                rollout_rewards.append(reward)
-                prompt_groups.setdefault(gid, []).append(first_seen[rid])
-            sample_to_rollout.append(first_seen[rid])
-
-        return {
-            "rewards": torch.stack(rollout_rewards),
-            "groups": list(prompt_groups.values()),
-            "sample_to_rollout": torch.tensor(sample_to_rollout),
-            "exp_len": exp_len,
-        }
-
-    @staticmethod
-    def _per_sample_rewards(experiences: List[Experience]) -> dict:
-        """No-merge path: every sample is its own rollout (one-element groups).
-
-        reinforce / gae score each sample independently, so a
-        multi-turn rollout split into several samples must NOT collapse to one reward
-        (only the group baselines need that). Each sample keeps its own reward; the
-        identity sample->row map leaves the per-sample broadcast unchanged.
-        """
-        rewards = torch.cat([e.rewards for e in experiences], dim=0)
-        n = rewards.numel()
-        return {
-            "rewards": rewards,
-            "groups": [[i] for i in range(n)],
-            "sample_to_rollout": torch.arange(n),
-            "exp_len": [len(e.index) for e in experiences],
-        }
-
     @torch.no_grad()
     def compute_advantages_and_returns(self, experiences: List[Experience]) -> List[Experience]:
-        """Clip rewards, run the estimator (which returns per-token advantages/returns), assemble onto exps.
-
-        Estimators live in `advantage.py` and never see `Experience`: this method extracts the small
-        tensor inputs (rewards, action masks, per-token KL), builds the `AdvantageContext`, and
-        writes the returned advantages/returns/info back onto each experience. Only the group
-        baselines merge multi-turn step-samples to one reward per rollout; reinforce/gae score
-        each sample independently (see `_per_sample_rewards`).
-        """
+        """Keep per-trace rewards, compute group statistics, and assemble token advantages."""
         args = self.args
-        if self.advantage_estimator in GROUP_ADVANTAGE_ESTIMATORS:
-            rollouts = self._merge_rollout_rewards(experiences)
-        else:
-            rollouts = self._per_sample_rewards(experiences)
+        rewards = torch.cat([exp.rewards for exp in experiences])
+        exp_len = [exp.rewards.numel() for exp in experiences]
+        ids = [rollout_and_group_ids(exp) for exp in experiences]
+        rollout_ids = list(itertools.chain.from_iterable(r for r, _ in ids))
+        group_ids = list(itertools.chain.from_iterable(g for _, g in ids))
+        if not (len(rollout_ids) == len(group_ids) == rewards.numel()):
+            raise ValueError("id/reward length mismatch")
 
-        # Clip the raw per-rollout reward before the baseline.
+        prompt_groups = {}
+        for index, (rid, gid) in enumerate(zip(rollout_ids, group_ids)):
+            prompt_groups.setdefault(gid, {}).setdefault(rid, []).append(index)
+        groups = [list(rollouts.values()) for rollouts in prompt_groups.values()]
+        if self.advantage_estimator not in GROUP_ADVANTAGE_ESTIMATORS:
+            groups = [[[index]] for index in range(rewards.numel())]
+        counts = torch.cat([exp.action_mask.sum(dim=-1) for exp in experiences]).to(rewards)
+        weights = torch.zeros_like(rewards)
+        for group in groups:
+            for rollout in group:
+                weights[rollout] = counts[rollout] / counts[rollout].sum().clamp_min(1)
+
         clip = args.reward.clip_range
-        rewards = rollouts["rewards"].clamp(min=clip[0], max=clip[1]) if clip else rollouts["rewards"]
+        if clip:
+            rewards = rewards.clamp(min=clip[0], max=clip[1])
 
         # PPO/gae is the only estimator that consumes a learned value baseline; the
         # critic filled exp.values during make_experience. Other estimators ignore it.
         needs_values = self.advantage_estimator == "gae"
         ctx = AdvantageContext(
-            sample_to_rollout=rollouts["sample_to_rollout"],
-            exp_len=rollouts["exp_len"],
+            trace_weights=weights,
+            exp_len=exp_len,
             action_masks=[exp.action_mask for exp in experiences],
             kl_coef=self.kl_ctl.value,
             gamma=args.algo.advantage.gamma,
@@ -241,13 +185,14 @@ class RemoteExperienceMaker:
             values=[exp.values for exp in experiences] if needs_values else None,
             no_whiten=args.algo.advantage.no_whiten,
         )
-        advantages, returns = get_advantage_estimator(self.advantage_estimator)(rewards, rollouts["groups"], ctx)
+        advantages, returns = get_advantage_estimator(self.advantage_estimator)(rewards, groups, ctx)
 
-        # Per-group reward std (on clipped rewards), broadcast to samples, for logging only.
-        rollout_stds = torch.zeros_like(rewards)
-        for group in rollouts["groups"]:
-            rollout_stds[group] = rewards[group].std() if len(group) > 1 else 0.0
-        sample_stds = rollout_stds[rollouts["sample_to_rollout"]].split(rollouts["exp_len"])
+        trace_stds = torch.zeros_like(rewards)
+        for group in groups:
+            _, std = group_reward_moments(rewards, group, weights)
+            for rollout in group:
+                trace_stds[rollout] = std
+        sample_stds = trace_stds.split(exp_len)
 
         # Assemble the experiences from the computed tensors.
         for exp, adv, ret, std in zip(experiences, advantages, returns, sample_stds):

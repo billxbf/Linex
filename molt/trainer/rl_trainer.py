@@ -112,32 +112,26 @@ def prepare_datasets(strategy):
     return prompts_dataloader, eval_dataloader, max_steps
 
 
-def _collect_rollout_rewards(rollout_samples):
-    """Regroup the flattened rollout rows back into rollouts and prompt groups.
-
-    A multi-turn rollout appears in ``rollout_samples`` once per step it took, and every one of
-    those rows carries the same terminal reward, so averaging the rows weights each trajectory by
-    its length. The weighting is not neutral: a failing episode runs to the step cap while a
-    successful one stops as soon as it is done, so the rows that dominate the mean are the
-    zero-reward ones. On an OSWorld run this read 0.28 where the same checkpoint scored 0.4487 on
-    the same tasks through the eval path, which groups before averaging.
-
-    Returns (one reward per rollout, one mean reward per prompt group).
-    """
-    reward_of_rollout: dict = {}  # every row of a rollout carries the same terminal reward
-    rewards_in_group: dict = {}
+def _collect_rollout_rewards(rollout_samples, key="reward"):
+    """Action-token mean within each rollout, then equal rollout weight within each prompt."""
+    totals = {}
+    groups = {}
     for sample in rollout_samples:
-        if "reward" not in sample.info:
+        if key not in sample.info:
             continue
         rollout_ids, group_ids = rollout_and_group_ids(sample)
-        sample_rewards = sample.info["reward"].flatten().tolist()
-        for rollout_id, group_id, reward in zip(rollout_ids, group_ids, sample_rewards, strict=True):
-            if rollout_id not in reward_of_rollout:
-                reward_of_rollout[rollout_id] = reward
-                rewards_in_group.setdefault(group_id, []).append(reward)
+        rewards = sample.info[key].flatten().tolist()
+        counts = sample.response_length.flatten().tolist()
+        for rid, gid, reward, count in zip(rollout_ids, group_ids, rewards, counts, strict=True):
+            if rid not in totals:
+                totals[rid] = [0.0, 0.0]
+                groups.setdefault(gid, []).append(rid)
+            totals[rid][0] += reward * count
+            totals[rid][1] += count
+    means = {rid: total / count for rid, (total, count) in totals.items()}
     return (
-        list(reward_of_rollout.values()),
-        [statistics.fmean(rewards) for rewards in rewards_in_group.values()],
+        list(means.values()),
+        [statistics.fmean(means[rid] for rid in group) for group in groups.values()],
     )
 
 
@@ -343,7 +337,7 @@ class BaseRLTrainer:
         rollout_stats = {
             "rollout/reward_mean": statistics.fmean(per_rollout) if per_rollout else 0.0,
             "rollout/reward_std": statistics.stdev(per_rollout) if len(per_rollout) > 1 else 0.0,
-            # Same name as eval's pass1 because it is the same quantity, on the same scale.
+            # Prompt means of the training reward; pure Harbor evaluation is logged separately.
             "rollout/pass1": statistics.fmean(per_group) if per_group else 0.0,
             "rollout/num_rollouts": float(len(per_rollout)),
             "rollout/num_prompt_groups": float(len(per_group)),
@@ -353,6 +347,11 @@ class BaseRLTrainer:
             "rollout/truncated_rate": truncated.float().mean().item(),
             "rollout/num_samples": float(num_turn_rows),
         }
+
+        for metric, key in (("harbor_mean", "harbor_reward"), ("judge_mean", "judge_reward")):
+            values, _ = _collect_rollout_rewards(rollout_samples, key)
+            if values:
+                rollout_stats[f"rollout/{metric}"] = statistics.fmean(values)
 
         # Push the experiences to the actor shards (and the critic, which trains on the same batch
         # with values + returns) before optimization. Each rank fetches its samples' heavy tensors

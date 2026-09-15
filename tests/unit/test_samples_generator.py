@@ -498,6 +498,24 @@ def test_polar_multi_trace_session_shares_rollout_identity():
     assert {experience.rollout_ids[0] for experience in experiences} == {"session-1"}
 
 
+def test_polar_keeps_harbor_and_judge_rewards_aligned_when_an_earlier_trace_is_dropped():
+    traces = [
+        {"prompt_ids": prompt, "response_ids": [2], "loss_mask": [1], "response_logprobs": [-0.1], "reward": reward}
+        for prompt, reward in [([], 1.2), ([1], 0.8), ([1], 1.0)]
+    ]
+    result = _polar_task_result(traces)
+    result["results"][0]["trajectory"]["metadata"] = {"evaluation": {
+        "mode": "harbor_rubric", "outcome_reward": 1.0, "judge_scores": [5, -5, None],
+    }}
+    converted = _converter()._process_polar_task_result(result, max_length=16)
+    assert converted[0] == (None, "empty_prompt_tokens")
+    for (experience, reason), reward, judge in zip(converted[1:], [0.8, 1.0], [-1.0, 0.0]):
+        assert reason is None
+        assert experience.info["harbor_reward"].item() == 1.0
+        assert experience.info["judge_reward"].item() == judge
+        assert experience.rewards.item() == pytest.approx(reward)
+
+
 def test_polar_conversion_rejects_task_identity_mismatch():
     result = _polar_task_result([])
     result["results"][0]["task_id"] = "other-task"

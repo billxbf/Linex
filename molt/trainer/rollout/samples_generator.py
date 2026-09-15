@@ -444,7 +444,9 @@ class SamplesGenerator:
                 converted.append((None, "identity_mismatch"))
                 continue
 
-            for trace in session.trajectory.traces:
+            evaluation = session.trajectory.metadata.get("evaluation", {})
+            judge_scores = evaluation.get("judge_scores") or []
+            for trace_index, trace in enumerate(session.trajectory.traces):
                 if not trace.prompt_ids:
                     converted.append((None, "empty_prompt_tokens"))
                     continue
@@ -516,6 +518,14 @@ class SamplesGenerator:
                     "score": torch.tensor([reward]),
                     "response_clip_ratio": torch.tensor([len(sequence_ids) >= train_max_length]),
                 }
+                if evaluation.get("outcome_reward") is not None and (
+                    evaluation.get("mode") in ("harbor", "harbor_rubric")
+                    or evaluation.get("strategy") in ("harbor", "harbor_rubric")
+                    or "harbor_task" in session.metadata
+                ):
+                    score = judge_scores[trace_index] if trace_index < len(judge_scores) else None
+                    info["harbor_reward"] = torch.tensor([float(evaluation["outcome_reward"])])
+                    info["judge_reward"] = torch.tensor([score / 5.0 if score is not None else 0.0])
                 if trace.media_paths:
                     info["image_tokens"] = torch.tensor([image_tokens])
                 for name, value in session.timing.model_dump().items():

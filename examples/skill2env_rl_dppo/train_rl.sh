@@ -22,6 +22,10 @@ fi
 
 test -d "$MODEL_PATH" || { echo "Policy model not found: $MODEL_PATH"; exit 1; }
 test -s "$PROMPT_DATASET" || { echo "Prepared task dataset not found: $PROMPT_DATASET (run prepare.py)"; exit 1; }
+if [ -z "${NVIDIA_API_KEY:-}" ] && grep -Eq '"judge_api_key_env"[[:space:]]*:[[:space:]]*"NVIDIA_API_KEY"' "$PROMPT_DATASET"; then
+  echo "NVIDIA_API_KEY is required by the prepared rubric tasks" >&2
+  exit 1
+fi
 command -v apptainer >/dev/null || { echo "Skill2Env RL requires Apptainer in PATH"; exit 1; }
 mkdir -p "$SAVE_ROOT"
 ulimit -n 65536 2>/dev/null || { echo "Skill2Env RL requires a nofile limit of at least 65536"; exit 1; }
@@ -100,7 +104,6 @@ python3 -u -m molt.cli.train_rl_ray \
   --actor.dppo_kl_threshold "${DPPO_KL_THRESHOLD:-0.05}" \
   --algo.advantage.is_correction_level off \
   --algo.kl.init_coef 0 \
-  --reward.clip_range 0 1 \
   --vllm.num_engines "${VLLM_NUM_ENGINES:-4}" \
   --vllm.tensor_parallel_size "${VLLM_TP_SIZE:-1}" \
   --vllm.tool_call_parser "${TOOL_CALL_PARSER:-qwen3_xml}" \

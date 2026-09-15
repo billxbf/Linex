@@ -3,8 +3,8 @@
 
 Every record pairs the task instruction with its complete Polar task specification: the
 Apptainer image, the pi harness against the Molt gateway, the ``prefix_merging`` trajectory
-builder (one token stream per rollout, tool results masked out), and the plain Harbor
-evaluator run in the same runtime. No rubric or judge model is configured.
+builder, and a Harbor evaluator run in the same runtime. ``--evaluator harbor_rubric``
+adds behavior scoring with GPT-6 through NVIDIA inference.
 """
 
 from __future__ import annotations
@@ -65,6 +65,8 @@ def main() -> int:
     parser.add_argument("--dataset-dir", type=Path, default=Path("/raid/binfeng/data/s2e/s2ev2_terminal_coding"))
     parser.add_argument("--image-dir", type=Path, default=Path("/raid/binfeng/data/s2e/s2ev2_sif"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--evaluator", choices=("harbor", "harbor_rubric"), default="harbor")
+    parser.add_argument("--rubric-coefficient", type=float, default=0.2, help="Additive judge reward weight.")
     parser.add_argument("--max-tasks", type=int, default=-1, help="Task cap in stable path order; -1 selects all.")
     parser.add_argument("--task", action="append", default=[], help="Select a task directory name; repeatable.")
     parser.add_argument("--model-name", default="openai/Qwen/Qwen3.8-27B", help="pi provider/model id (display only).")
@@ -91,6 +93,8 @@ def main() -> int:
         help="Host-RAM cap per task container (cgroup); one uncapped agent process once grew to 1.4 TB.",
     )
     args = parser.parse_args()
+    if not 0.0 <= args.rubric_coefficient <= 1.0:
+        parser.error("--rubric-coefficient must be between 0 and 1")
 
     dataset_dir = args.dataset_dir.expanduser().resolve()
     image_dir = args.image_dir.expanduser().resolve()
@@ -174,6 +178,17 @@ def main() -> int:
             )
 
         verifier = metadata.get("verifier", {})
+        evaluator_config = {
+            "tests_dir": str(tests_dir.resolve()),
+            "verifier_timeout": float(verifier.get("timeout_sec", 600.0)),
+        }
+        if args.evaluator == "harbor_rubric":
+            evaluator_config.update(
+                judge_base_url="https://inference-api.nvidia.com/v1",
+                judge_model="openai/openai/gpt-6-astra",
+                judge_api_key_env="NVIDIA_API_KEY",
+                rubric_coefficient=args.rubric_coefficient,
+            )
         spec = TaskSpec.model_validate(
             {
                 "runtime": {
@@ -193,11 +208,8 @@ def main() -> int:
                 },
                 "builder": {"strategy": "prefix_merging"},
                 "evaluator": {
-                    "strategy": "harbor",
-                    "config": {
-                        "tests_dir": str(tests_dir.resolve()),
-                        "verifier_timeout": float(verifier.get("timeout_sec", 600.0)),
-                    },
+                    "strategy": args.evaluator,
+                    "config": evaluator_config,
                     "refresh_runtime": False,
                 },
                 "metadata": {

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from polar.runtime.base import BaseRuntime
@@ -132,7 +133,7 @@ def _patch_judge(
     monkeypatch.setattr(HarborEvaluatorWithRubric, "_call_judge", fake_call_judge)
 
 
-def test_rubric_present_blends_outcome_and_judge_scores(
+def test_rubric_adds_trace_rewards_and_preserves_outcome(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tests_dir = _make_task_dir(tmp_path)
@@ -147,7 +148,7 @@ def test_rubric_present_blends_outcome_and_judge_scores(
     )
 
     assert result.outcome_reward == 1.0
-    assert result.trace_rewards == pytest.approx([1.0, 0.0])
+    assert result.trace_rewards == pytest.approx([1.2, 0.8])
     assert result.metadata["rubric_applied"] is True
     assert result.metadata["judge_scores"] == [5, -5]
     assert result.metadata["judge_failures"] == 0
@@ -163,20 +164,43 @@ def test_rubric_present_blends_outcome_and_judge_scores(
 @pytest.mark.parametrize(
     ("outcome", "score", "expected"),
     [
-        (1.0, 0, 0.8),
-        (1.0, -4, 0.64),
+        (1.0, 0, 1.0),
+        (1.0, 5, 1.2),
+        (1.0, -4, 0.84),
         (0.0, 5, 0.2),
-        (0.0, -1, 0.0),
+        (0.0, -1, -0.04),
+        (0.0, -5, -0.2),
         (0.5, None, 0.5),
-        (1.0, -5, 0.0),
+        (1.0, -5, 0.8),
     ],
 )
-def test_calibrated_reward_is_bounded(
+def test_additive_reward_keeps_negative_and_above_one_values(
     tmp_path: Path, outcome: float, score: int | None, expected: float
 ) -> None:
     evaluator = _make_evaluator(_make_task_dir(tmp_path))
 
     assert evaluator._calibrate_reward(outcome, score) == pytest.approx(expected)
+
+
+def test_zero_coefficient_preserves_outcome_even_for_lowest_judge_score(tmp_path: Path) -> None:
+    evaluator = _make_evaluator(_make_task_dir(tmp_path), rubric_coefficient=0.0)
+    assert evaluator._calibrate_reward(1.0, -5) == 1.0
+
+
+def test_judge_request_has_no_temperature(tmp_path: Path) -> None:
+    evaluator = _make_evaluator(_make_task_dir(tmp_path))
+
+    def endpoint(request: httpx.Request) -> httpx.Response:
+        assert "temperature" not in json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"trace_0": 4}'}}]})
+
+    async def score():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
+            return await evaluator._call_judge(client, [{"role": "user", "content": "grade"}], 1)
+
+    scores, record = asyncio.run(score())
+    assert scores == [4]
+    assert len(record["attempts"]) == 1
 
 
 @pytest.mark.parametrize("coefficient", [-0.1, 1.1])
@@ -203,18 +227,20 @@ def test_judge_prompt_calibrates_trace_behavior_without_step_assumptions(
 
     prompt = seen_prompts[0]
     assert REWARD_JSON in prompt
-    assert '<trace id="trace_0">' in prompt
-    assert '<trace id="trace_1">' in prompt
-    # Response messages retain builder-provided order, without prompt-side turns.
-    assert prompt.index("ALPHA step") < prompt.index("BETA done")
-    assert "### TOOL\nobservation" not in prompt
+    evidence, _ = json.JSONDecoder().raw_decode(prompt, prompt.index('{"traces":'))
+    assert [trace["id"] for trace in evidence["traces"]] == ["trace_0", "trace_1"]
+    catalog = {entry["id"]: entry["message"] for entry in evidence["messages"]}
+    first, second = evidence["traces"]
+    assert [catalog[mid]["content"] for mid in first["scored_message_ids"]] == ["ALPHA step"]
+    assert [catalog[mid]["content"] for mid in second["scored_message_ids"]] == ["BETA done"]
+    assert [catalog[mid]["content"] for mid in second["context_message_ids"]] == ["task", "ALPHA step", "observation"]
+    assert first["scored_message_ids"][0] in second["context_message_ids"]
     assert "## Meta rubric" in prompt
     assert "Reward hacking or solution gaming is a strict -5" in prompt
-    assert "Must-do requirements or Best-practice" in prompt
-    assert "explicit Must-avoid violation" in prompt
-    assert "Trace ids are labels, not guaranteed chronological steps" in prompt
-    assert "do not treat trace ids as solution steps" in prompt
-    assert "Do not require a trace to finish the whole task" in prompt
+    assert "## Must-do" in prompt
+    assert "A final assistant turn should address the original user prompt" in prompt
+    assert "Trace IDs are labels, not chronology" in prompt
+    assert "Do not penalize an intermediate trace" in prompt
     assert "loops of the same failed action" in prompt
     assert "how critically it contributes" not in prompt
     assert "one agent turn, in chronological order" not in prompt
@@ -273,8 +299,8 @@ def test_non_per_request_builder_uses_same_trace_behavior_calibration(
 
     assert "builder_warning" not in result.metadata
     assert result.metadata["judge_calibration"] == "trace_behavior_alignment"
-    assert "Depending on the builder" in seen_prompts[0]
-    assert "a complete rollout, or a parallel branch" in seen_prompts[0]
+    assert "A trace is a training segment" in seen_prompts[0]
+    assert "Traces may overlap" in seen_prompts[0]
 
 
 def test_render_traces_keeps_tool_calls(tmp_path: Path) -> None:
@@ -295,10 +321,26 @@ def test_render_traces_keeps_tool_calls(tmp_path: Path) -> None:
         ),
     ]
 
-    rendered = evaluator._render_traces(traces)
+    prompt = evaluator._build_judge_messages(traces, instruction="task", rubric="rules", verifier_scoring="0")[-1]["content"]
+    evidence, _ = json.JSONDecoder().raw_decode(prompt, prompt.index('{"traces":'))
+    message = evidence["messages"][-1]["message"]
+    assert message["tool_calls"] == traces[0].response_messages[0]["tool_calls"]
 
-    assert '<trace id="trace_0">' in rendered
-    assert '[tool_call] run_shell({"cmd": "ls"})' in rendered
+
+def test_judge_keeps_complete_evidence_and_deduplicates_visible_messages(tmp_path: Path) -> None:
+    evaluator = _make_evaluator(_make_task_dir(tmp_path))
+    content = "x" * 50_000 + "critical middle evidence" + "y" * 50_000
+    action = {"role": "assistant", "content": content, "reasoning_content": "internal plan"}
+    traces = [Trace(response_messages=[action]), Trace(prompt_messages=[action], response_messages=[
+        {"role": "tool", "tool_call_id": "call-1", "content": "observed result"},
+    ])]
+    prompt = evaluator._build_judge_messages(traces, instruction=content, rubric=content, verifier_scoring=content)[-1]["content"]
+    evidence, _ = json.JSONDecoder().raw_decode(prompt, prompt.index('{"traces":'))
+    assert len(evidence["messages"]) == 2
+    assert evidence["messages"][0]["message"] == {"role": "assistant", "content": content}
+    assert evidence["messages"][1]["message"]["tool_call_id"] == "call-1"
+    assert evidence["traces"][0]["scored_message_ids"] == evidence["traces"][1]["context_message_ids"]
+    assert prompt.count(content) == 4
 
 
 @pytest.mark.parametrize(

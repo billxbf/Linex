@@ -15,17 +15,17 @@
 
 """Pluggable advantage estimators.
 
-An estimator turns per-rollout rewards (already clipped, deduped, and grouped by
-prompt) into per-token advantages and returns, one tensor per experience:
+An estimator turns per-trace rewards into per-token advantages and returns.
+Prompt groups contain rollouts, and each rollout contains its trace indices:
 
     estimator(rewards, groups, ctx) -> (advantages, returns)
-        rewards     (R,) tensor          one clipped scalar reward per rollout
-        groups      list[list[int]]      rollout rows sharing a prompt (the GRPO group)
+        rewards     (S,) tensor          one clipped scalar reward per trace
+        groups      list[list[list[int]]]  prompt -> rollout -> trace indices
         ctx         AdvantageContext     sample/mask/kl/gamma tensors + flags
         advantages  list[(B, L) tensor]  per experience, ready for the policy loss
         returns     list[(B, L) tensor]  per experience (advantages before whitening)
 
-Estimators call the helpers `broadcast_advantages` (scalar advantage -> token-level
+Estimators call the helpers `expand_trace_advantages` (scalar advantage -> token-level
 `advantage * action_mask`) and `normalize_advantages` (cross-batch whitening), both
 operating on plain tensors — estimators never see `Experience`. The outcome-reward
 estimators broadcast flat; `reinforce` is REINFORCE++ (per-token KL reward +
@@ -38,8 +38,10 @@ Register a custom estimator without editing this file::
     def my_estimator(rewards, groups, ctx):
         adv = rewards.clone()
         for group in groups:
-            adv[group] = rewards[group] - rewards[group].median()
-        returns = broadcast_advantages(adv, ctx)
+            mean, _ = group_reward_moments(rewards, group, ctx.trace_weights)
+            for rollout in group:
+                adv[rollout] = rewards[rollout] - mean
+        returns = expand_trace_advantages(adv, ctx)
         return normalize_advantages(returns, ctx), returns
 """
 
@@ -55,7 +57,7 @@ import torch
 class AdvantageContext:
     """Small tensor/scalar inputs an estimator needs (never the `Experience` objects)."""
 
-    sample_to_rollout: torch.Tensor  # (S,) maps each concat-order sample to its rollout row
+    trace_weights: torch.Tensor  # (S,) action-token weights normalized within each rollout
     exp_len: List[int]  # samples per experience (to re-split per-sample tensors)
     action_masks: List[torch.Tensor]  # per experience (B, L)
     kl_coef: float  # per-token KL reward coefficient (REINFORCE++ / GAE)
@@ -67,7 +69,7 @@ class AdvantageContext:
 
 
 Estimator = Callable[
-    [torch.Tensor, List[List[int]], "AdvantageContext"],
+    [torch.Tensor, List[List[List[int]]], "AdvantageContext"],
     Tuple[List[torch.Tensor], List[torch.Tensor]],
 ]
 
@@ -95,10 +97,20 @@ def get_advantage_estimator(name: str) -> Estimator:
 # ──────────────── tensor helpers (no Experience; the trainer assembles those) ────────────────
 
 
-def broadcast_advantages(rollout_advantages: torch.Tensor, ctx: AdvantageContext) -> List[torch.Tensor]:
-    """Broadcast each rollout's scalar advantage onto its response tokens (`advantage * action_mask`)."""
-    sample_advantages = rollout_advantages[ctx.sample_to_rollout].split(ctx.exp_len)
+def expand_trace_advantages(advantages: torch.Tensor, ctx: AdvantageContext) -> List[torch.Tensor]:
+    """Apply each trace's own advantage to its action tokens."""
+    sample_advantages = advantages.split(ctx.exp_len)
     return [adv.unsqueeze(-1) * mask for adv, mask in zip(sample_advantages, ctx.action_masks)]
+
+
+def group_reward_moments(rewards, group, trace_weights):
+    """Equal rollout weight, including within-rollout variance; sample correction uses rollout count."""
+    indices = [index for rollout in group for index in rollout]
+    values, weights = rewards[indices], trace_weights[indices]
+    # Center first so a constant-reward group remains exactly constant in floating point.
+    mean = values[0] + ((values - values[0]) * weights).sum() / len(group)
+    variance = ((values - mean).square() * weights).sum() / max(len(group) - 1, 1)
+    return mean, variance.sqrt()
 
 
 def normalize_advantages(advantages: List[torch.Tensor], ctx: AdvantageContext) -> List[torch.Tensor]:
@@ -118,10 +130,7 @@ def normalize_advantages(advantages: List[torch.Tensor], ctx: AdvantageContext) 
     return [(a - mean) * rstd for a in advantages]
 
 
-# Estimators that normalize rewards within a prompt group; only these need the
-# rollout-reward merge (one reward per rollout, grouped by prompt). reinforce and
-# gae score each sample independently, so in multi-turn rollouts that
-# split one trajectory into several samples they must NOT merge (see compute_advantages).
+# Group estimators use rollout membership for their baseline, keeping every trace reward.
 GROUP_ADVANTAGE_ESTIMATORS = frozenset({"grpo", "dr_grpo", "reinforce_baseline", "rloo"})
 
 
@@ -130,15 +139,15 @@ GROUP_ADVANTAGE_ESTIMATORS = frozenset({"grpo", "dr_grpo", "reinforce_baseline",
 
 @register_advantage_estimator("reinforce")
 def reinforce(
-    rewards: torch.Tensor, groups: List[List[int]], ctx: AdvantageContext
+    rewards: torch.Tensor, groups: List[List[List[int]]], ctx: AdvantageContext
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """REINFORCE++ (https://arxiv.org/abs/2501.03262): no group baseline.
 
-    Each rollout's clipped scalar reward is placed on its last response token, a per-token KL
+    Each trace's clipped scalar reward is placed on its last response token, a per-token KL
     penalty (-kl_coef * kl) is added, and discounted cumulative returns are accumulated. The
     resulting advantages are whitened across the batch.
     """
-    sample_rewards = rewards[ctx.sample_to_rollout].split(ctx.exp_len)
+    sample_rewards = rewards.split(ctx.exp_len)
     returns = []
     for reward, mask, kl in zip(sample_rewards, ctx.action_masks, ctx.kls):
         token_reward = (-ctx.kl_coef * kl).float()  # (B, L) per-token KL penalty
@@ -166,45 +175,49 @@ def reinforce(
 
 @register_advantage_estimator("reinforce_baseline")
 def reinforce_baseline(
-    rewards: torch.Tensor, groups: List[List[int]], ctx: AdvantageContext
+    rewards: torch.Tensor, groups: List[List[List[int]]], ctx: AdvantageContext
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Group-mean baseline; advantages whitened across the batch."""
     advantages = rewards.clone()
     for group in groups:
-        advantages[group] = rewards[group] - rewards[group].mean()
-    returns = broadcast_advantages(advantages, ctx)
+        mean, _ = group_reward_moments(rewards, group, ctx.trace_weights)
+        for rollout in group:
+            advantages[rollout] = rewards[rollout] - mean
+    returns = expand_trace_advantages(advantages, ctx)
     return normalize_advantages(returns, ctx), returns
 
 
 @register_advantage_estimator("dr_grpo")
 def dr_grpo(
-    rewards: torch.Tensor, groups: List[List[int]], ctx: AdvantageContext
+    rewards: torch.Tensor, groups: List[List[List[int]]], ctx: AdvantageContext
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Dr.GRPO (https://arxiv.org/abs/2503.20783): group-mean baseline, no std, no whitening."""
     advantages = rewards.clone()
     for group in groups:
-        advantages[group] = rewards[group] - rewards[group].mean()
-    returns = broadcast_advantages(advantages, ctx)
+        mean, _ = group_reward_moments(rewards, group, ctx.trace_weights)
+        for rollout in group:
+            advantages[rollout] = rewards[rollout] - mean
+    returns = expand_trace_advantages(advantages, ctx)
     return [ret.clone() for ret in returns], returns
 
 
 @register_advantage_estimator("grpo")
 def grpo(
-    rewards: torch.Tensor, groups: List[List[int]], ctx: AdvantageContext
+    rewards: torch.Tensor, groups: List[List[List[int]]], ctx: AdvantageContext
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """GRPO group-normalized advantage: (r - mean) / (std + eps)."""
+    """Per-trace GRPO: (trace reward - group mean) / (group std + eps)."""
     advantages = rewards.clone()
     for group in groups:
-        group_rewards = rewards[group]
-        std = group_rewards.std() if len(group) > 1 else 0.0
-        advantages[group] = (group_rewards - group_rewards.mean()) / (std + 1e-9)
-    returns = broadcast_advantages(advantages, ctx)
+        mean, std = group_reward_moments(rewards, group, ctx.trace_weights)
+        for rollout in group:
+            advantages[rollout] = (rewards[rollout] - mean) / (std + 1e-9)
+    returns = expand_trace_advantages(advantages, ctx)
     return [ret.clone() for ret in returns], returns
 
 
 @register_advantage_estimator("rloo")
 def rloo(
-    rewards: torch.Tensor, groups: List[List[int]], ctx: AdvantageContext
+    rewards: torch.Tensor, groups: List[List[List[int]]], ctx: AdvantageContext
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Leave-one-out baseline (RLOO, https://arxiv.org/abs/2402.14740).
 
@@ -212,18 +225,21 @@ def rloo(
     """
     advantages = rewards.clone()
     for group in groups:
-        group_rewards = rewards[group]
+        mean, _ = group_reward_moments(rewards, group, ctx.trace_weights)
         if len(group) > 1:
-            advantages[group] = group_rewards - (group_rewards.sum() - group_rewards) / (len(group) - 1)
+            for rollout in group:
+                own_mean = (rewards[rollout] * ctx.trace_weights[rollout]).sum()
+                baseline = (mean * len(group) - own_mean) / (len(group) - 1)
+                advantages[rollout] = rewards[rollout] - baseline
         # singleton group: no leave-one-out baseline exists, so the advantage stays the raw
         # reward (REINFORCE without baseline) — intentional, not zeroed.
-    returns = broadcast_advantages(advantages, ctx)
+    returns = expand_trace_advantages(advantages, ctx)
     return [ret.clone() for ret in returns], returns
 
 
 @register_advantage_estimator("gae")
 def gae(
-    rewards: torch.Tensor, groups: List[List[int]], ctx: AdvantageContext
+    rewards: torch.Tensor, groups: List[List[List[int]]], ctx: AdvantageContext
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """PPO advantage with a learned value baseline (GAE).
 
@@ -253,7 +269,7 @@ def gae(
     """
     if ctx.values is None:
         raise ValueError("gae requires AdvantageContext.values (advantage_estimator=gae needs a critic)")
-    sample_rewards = rewards[ctx.sample_to_rollout].split(ctx.exp_len)
+    sample_rewards = rewards.split(ctx.exp_len)
     advantages, returns = [], []
     for reward, mask, kl, values in zip(sample_rewards, ctx.action_masks, ctx.kls, ctx.values):
         # per-token reward: KL penalty + clipped scalar reward on the last action token

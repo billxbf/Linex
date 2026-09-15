@@ -17,6 +17,7 @@ def _sample(rollout_ids, group_ids, rewards):
         rollout_ids=rollout_ids,
         group_ids=group_ids,
         index=list(range(len(rewards))),
+        response_length=torch.ones(len(rewards)),
     )
 
 
@@ -48,6 +49,7 @@ def test_single_turn_legacy_path_is_an_identity():
         rollout_ids=None,
         group_ids=None,
         index=[0, 1, 2, 3],
+        response_length=torch.ones(4),
     )
     per_rollout, per_group = _collect_rollout_rewards([sample])
     assert per_rollout == [1.0, 0.0, 1.0, 0.0]
@@ -79,3 +81,14 @@ def test_shared_id_fallbacks():
 
     bare = types.SimpleNamespace(rollout_ids=None, group_ids=None, index=[7])
     assert rollout_and_group_ids(bare) == ([7], [7])
+
+
+def test_harbor_shaped_and_judge_metrics_share_the_same_rollout_weights():
+    sample = _sample(["A", "A", "B"], ["g"] * 3, [1.2, 0.8, 0.0])
+    sample.response_length = torch.tensor([1, 3, 2])
+    sample.info["harbor_reward"] = torch.tensor([1.0, 1.0, 0.0])
+    sample.info["judge_reward"] = torch.tensor([1.0, -1.0, 0.0])
+    for key, expected in [("reward", 0.45), ("harbor_reward", 0.5), ("judge_reward", -0.25)]:
+        per_rollout, per_group = _collect_rollout_rewards([sample], key)
+        assert sum(per_rollout) / len(per_rollout) == pytest.approx(expected)
+        assert per_group == pytest.approx([expected])

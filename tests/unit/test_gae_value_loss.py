@@ -87,7 +87,7 @@ def _ctx(masks, kls, values, kl_coef, gamma, lam):
     """A single-experience AdvantageContext (one rollout per sample, no merge)."""
     n = masks[0].size(0)
     return AdvantageContext(
-        sample_to_rollout=torch.arange(n),
+        trace_weights=torch.ones(n),
         exp_len=[n],
         action_masks=masks,
         kl_coef=kl_coef,
@@ -259,7 +259,7 @@ def test_reinforce_returns_and_advantages():
     reinforce = adv_mod.get_advantage_estimator("reinforce")
     mask = torch.ones(2, 3)
     ctx = AdvantageContext(
-        sample_to_rollout=torch.arange(2),
+        trace_weights=torch.ones(2),
         exp_len=[2],
         action_masks=[mask],
         kl_coef=0.0,
@@ -295,7 +295,7 @@ def test_reinforce_returns_match_reverse_recursion_with_masked_kl_rewards():
             expected[:, t] = running
 
         ctx = AdvantageContext(
-            sample_to_rollout=torch.arange(2),
+            trace_weights=torch.ones(2),
             exp_len=[2],
             action_masks=[mask],
             kl_coef=0.2,

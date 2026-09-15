@@ -14,7 +14,9 @@ from examples.skill2env_rl_dppo.prepare import PI_INSTALL
 from polar.rollout.models import TaskSpec
 
 
-def test_prepare_writes_pi_prefix_merging_harbor_task(tmp_path: Path) -> None:
+@pytest.mark.parametrize("evaluator", ["harbor", "harbor_rubric"])
+def test_prepare_writes_pi_prefix_merging_harbor_task(tmp_path: Path, monkeypatch, evaluator: str) -> None:
+    monkeypatch.setenv("NVIDIA_API_KEY", "unit-test-judge-key")
     dataset = tmp_path / "dataset"
     task_dir = dataset / "task_example_abcd1234"
     (task_dir / "environment").mkdir(parents=True)
@@ -22,6 +24,7 @@ def test_prepare_writes_pi_prefix_merging_harbor_task(tmp_path: Path) -> None:
     (task_dir / "instruction.md").write_text("Fix the workspace.\n")
     (task_dir / "environment" / "Dockerfile").write_text('FROM scratch\nWORKDIR "/work dir"\n')
     (task_dir / "tests" / "test.sh").write_text("#!/bin/bash\n")
+    (task_dir / "tests" / "rubric.md").write_text("Verify your changes and report accurately.\n")
     (task_dir / "task.toml").write_text(
         '[task]\nname = "skill2env/task_example_abcd1234"\n[metadata]\nsource_skill = "local/example"\n'
         "[verifier]\ntimeout_sec = 900\n"
@@ -42,6 +45,10 @@ def test_prepare_writes_pi_prefix_merging_harbor_task(tmp_path: Path) -> None:
             "--output",
             str(output),
             "--skip-image-check",
+            "--evaluator",
+            evaluator,
+            "--rubric-coefficient",
+            "0.15",
         ],
         check=True,
     )
@@ -57,9 +64,19 @@ def test_prepare_writes_pi_prefix_merging_harbor_task(tmp_path: Path) -> None:
     assert task.agent.model_name == "openai/Qwen/Qwen3.8-27B"
     assert task.agent.settings == {"context_window": 65536, "thinking": "high"}  # 98304 total - 32768 new tokens
     assert task.builder.strategy == "prefix_merging"
-    assert task.evaluator.strategy == "harbor"
+    assert task.evaluator.strategy == evaluator
     assert task.evaluator.refresh_runtime is False
-    assert task.evaluator.config == {"tests_dir": str((task_dir / "tests").resolve()), "verifier_timeout": 900.0}
+    expected_config = {"tests_dir": str((task_dir / "tests").resolve()), "verifier_timeout": 900.0}
+    if evaluator == "harbor_rubric":
+        expected_config.update(
+            judge_base_url="https://inference-api.nvidia.com/v1",
+            judge_model="openai/openai/gpt-6-astra",
+            judge_api_key_env="NVIDIA_API_KEY",
+            rubric_coefficient=0.15,
+        )
+    assert task.evaluator.config == expected_config
+    assert task.evaluator.env == {}
+    assert "unit-test-judge-key" not in output.read_text()
     assert task.metadata["skill2env_task"] == "task_example_abcd1234"
 
 
@@ -175,3 +192,14 @@ def test_launch_converts_rollout_counts_to_groups(tmp_path, monkeypatch, samples
     assert "--train.partial_rollout_enable" in arguments
     assert "--train.force_on_policy" in arguments
     assert "--train.force_sync_mode" not in arguments
+
+
+def test_rubric_launch_requires_key_before_starting_services(tmp_path, monkeypatch):
+    dataset = tmp_path / "tasks.jsonl"
+    dataset.write_text(json.dumps({"task": {"evaluator": {"config": {"judge_api_key_env": "NVIDIA_API_KEY"}}}}))
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setenv("MODEL_PATH", str(tmp_path))
+    monkeypatch.setenv("PROMPT_DATASET", str(dataset))
+    result = subprocess.run(["bash", "examples/skill2env_rl_dppo/train_rl.sh"], capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "NVIDIA_API_KEY is required" in result.stderr

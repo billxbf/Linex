@@ -36,7 +36,7 @@ from molt.trainer.algorithm.advantage import get_advantage_estimator as get_esti
 def _ctx(n: int) -> "AdvantageContext":
     """One experience of ``n`` single-token, fully-active rollouts (no KL, no values)."""
     return AdvantageContext(
-        sample_to_rollout=torch.arange(n),
+        trace_weights=torch.ones(n),
         exp_len=[n],
         action_masks=[torch.ones(n, 1)],
         kl_coef=0.0,
@@ -48,7 +48,7 @@ def _ctx(n: int) -> "AdvantageContext":
 
 
 def _run(name: str, rewards, groups):
-    adv, ret = get_estimator(name)(torch.tensor(rewards), groups, _ctx(len(rewards)))
+    adv, ret = get_estimator(name)(torch.tensor(rewards), [[[index] for index in group] for group in groups], _ctx(len(rewards)))
     return adv[0].flatten(), ret[0].flatten()
 
 

@@ -30,9 +30,10 @@ blocked = D > threshold and ((A > 0 and r > 1) or (A < 0 and r < 1))
 loss = -sum(unblocked * r * A) / total_action_tokens
 ```
 
-`A` is the group-standardized reward, shared by all segments of a rollout. The
-mask has no gradient. Blocked tokens remain in the denominator. Binary KL uses
-only the two sampled probabilities, so it needs no full-vocabulary entropy,
+`A` uses each trace's reward, with equal rollout weight in group statistics and
+action-token weighting within each rollout. Equal trace rewards within a rollout
+recover the shared advantage. The mask has no gradient. Blocked tokens remain in
+the denominator. Binary KL uses only the two sampled probabilities, so it needs no full-vocabulary entropy,
 top-K payload, reference model, or old-policy forward in this zero-KL recipe.
 Probabilities at numerical zero/one are clamped for KL evaluation; the existing
 log-ratio overflow guard also applies.
@@ -81,6 +82,36 @@ EVAL_DATASET="$SAVE_ROOT/eval_tasks.jsonl" EVAL_STEPS=25 \
 Evaluation defaults to one rollout per prompt, independently of training's G=8,
 and runs before the first update when `EVAL_DATASET` is supplied. `RESUME=1`
 resumes the checkpoints under this recipe's `SAVE_ROOT`.
+
+### Harbor rubric with NVIDIA GPT-6
+
+Select `harbor_rubric` when preparing training records. This configures
+`https://inference-api.nvidia.com/v1` with model `openai/openai/gpt-6-astra`.
+The default additive coefficient is 0.2; set `--rubric-coefficient` at preparation
+time to change it. Keep evaluation records on plain Harbor to measure task quality.
+
+```bash
+export SAVE_ROOT=/raid/binfeng/Linex/outputs/skill2env_rl_dppo_rubric
+: "${NVIDIA_API_KEY:?Set NVIDIA_API_KEY before launching rubric training}"
+export NVIDIA_API_KEY
+
+PYTHONPATH=. python3 examples/skill2env_rl_dppo/prepare.py \
+  --evaluator harbor_rubric --rubric-coefficient 0.2 \
+  --output "$SAVE_ROOT/train_tasks.jsonl" --skip-image-check
+PYTHONPATH=. python3 examples/skill2env_rl_dppo/prepare.py \
+  --dataset-dir /raid/binfeng/data/s2e/s2ev2_eval \
+  --output "$SAVE_ROOT/eval_tasks.jsonl" --skip-image-check
+
+PROMPT_DATASET="$SAVE_ROOT/train_tasks.jsonl" \
+EVAL_DATASET="$SAVE_ROOT/eval_tasks.jsonl" EVAL_STEPS=25 \
+WANDB_RUN_NAME=harbor_rubric_gpt6_dppo \
+  bash examples/skill2env_rl_dppo/train_rl.sh
+```
+
+The key is read from the Polar gateway's environment and forwarded through the
+Molt Ray job environment, including when attaching to an existing Ray cluster.
+Prepared task JSON contains only the environment-variable name. For a Docker
+launch, also pass `-e NVIDIA_API_KEY` to the training container.
 
 For a two-update checkpoint smoke, keep the full training dataset and use
 `SAVE_STEPS=2 bash examples/skill2env_rl_dppo/train_rl.sh --train.max_steps 2 --ckpt.disable_final_save`.
@@ -164,8 +195,12 @@ can be raised when trainer memory permits. The rollout budget is independent.
 | `PARTIAL_ROLLOUT` | 1 | Pause/refit/resume during generation |
 | `EVAL_SAMPLES_PER_PROMPT` | 1 | Independent evaluation sampling count |
 
-Track `rollout/reward_mean` and fixed-dataset evaluation scores. `policy_clip_ratio`
-is the fraction of action tokens blocked by DPPO; `policy_kl` is the sampled mean
+Track `rollout/harbor_mean` (raw verifier reward), `rollout/reward_mean` (training
+reward), and `rollout/judge_mean` (normalized judge contribution in `[-1, 1]`,
+zero when absent), alongside fixed-dataset evaluation scores. These means use
+action-token weights within each rollout, then equal rollout weights. WandB
+prefixes them with `train/`. The plain Harbor recipe has zero judge contribution.
+`policy_clip_ratio` is the fraction of action tokens blocked by DPPO; `policy_kl` is the sampled mean
 `log(mu) - log(pi)`, not the binary KL threshold statistic. `rollout_abs_logratio`
 tracks absolute behavior mismatch. `timing/policy_train`, `timing/actor_idle_wait`,
 `timing/vllm_idle_wait`, and `timing/step_total` distinguish training cost from

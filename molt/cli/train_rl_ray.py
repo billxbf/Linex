@@ -46,6 +46,7 @@ def _ray_runtime_env_vars():
         "NCCL_P2P_DISABLE",
         "NCCL_SHM_DISABLE",
         "NCCL_SOCKET_IFNAME",
+        "NVIDIA_API_KEY",
         "TRANSFORMERS_CACHE",
         "TORCH_COMPILE_DISABLE",
         "PYTORCH_CUDA_ALLOC_CONF",

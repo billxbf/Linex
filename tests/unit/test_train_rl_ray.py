@@ -144,6 +144,7 @@ def test_ray_runtime_env_forwards_wandb_settings(monkeypatch):
         "WANDB_MODE": "offline",
         "WANDB_RUN_ID": "persistent-run",
         "WANDB_RESUME": "allow",
+        "NVIDIA_API_KEY": "test-judge-key",
     }
     for name, value in expected.items():
         monkeypatch.setenv(name, value)
@@ -154,12 +155,12 @@ def test_ray_runtime_env_forwards_wandb_settings(monkeypatch):
 
 
 def test_ray_runtime_env_omits_empty_optional_settings(monkeypatch):
-    for name in ("WANDB_API_KEY", "WANDB_ENTITY", "WANDB_MODE"):
+    for name in ("WANDB_API_KEY", "WANDB_ENTITY", "WANDB_MODE", "NVIDIA_API_KEY"):
         monkeypatch.delenv(name, raising=False)
 
     env_vars = _ray_runtime_env_vars()
 
-    assert not {"WANDB_API_KEY", "WANDB_ENTITY", "WANDB_MODE"} & env_vars.keys()
+    assert not {"WANDB_API_KEY", "WANDB_ENTITY", "WANDB_MODE", "NVIDIA_API_KEY"} & env_vars.keys()
 
 
 def test_eval_only_prepares_only_the_eval_dataset(monkeypatch):
