@@ -15,8 +15,7 @@ from polar.rollout.models import TaskSpec
 
 
 @pytest.mark.parametrize("evaluator", ["harbor", "harbor_rubric"])
-def test_prepare_writes_pi_prefix_merging_harbor_task(tmp_path: Path, monkeypatch, evaluator: str) -> None:
-    monkeypatch.setenv("NVIDIA_API_KEY", "unit-test-judge-key")
+def test_prepare_writes_pi_prefix_merging_harbor_task(tmp_path: Path, evaluator: str) -> None:
     dataset = tmp_path / "dataset"
     task_dir = dataset / "task_example_abcd1234"
     (task_dir / "environment").mkdir(parents=True)
@@ -33,6 +32,9 @@ def test_prepare_writes_pi_prefix_merging_harbor_task(tmp_path: Path, monkeypatc
     images.mkdir()
     (images / "task_example_abcd1234.sif").write_bytes(b"test")
     output = tmp_path / "out" / "train_tasks.jsonl"
+    judge_args = []
+    if evaluator == "harbor_rubric":
+        judge_args = ["--judge-base-url", "http://localhost:8001/v1", "--judge-model", "test-judge"]
 
     subprocess.run(
         [
@@ -49,6 +51,7 @@ def test_prepare_writes_pi_prefix_merging_harbor_task(tmp_path: Path, monkeypatc
             evaluator,
             "--rubric-coefficient",
             "0.15",
+            *judge_args,
         ],
         check=True,
     )
@@ -69,14 +72,12 @@ def test_prepare_writes_pi_prefix_merging_harbor_task(tmp_path: Path, monkeypatc
     expected_config = {"tests_dir": str((task_dir / "tests").resolve()), "verifier_timeout": 900.0}
     if evaluator == "harbor_rubric":
         expected_config.update(
-            judge_base_url="https://inference-api.nvidia.com/v1",
-            judge_model="openai/openai/gpt-6-astra",
-            judge_api_key_env="NVIDIA_API_KEY",
+            judge_base_url="http://localhost:8001/v1",
+            judge_model="test-judge",
             rubric_coefficient=0.15,
         )
     assert task.evaluator.config == expected_config
     assert task.evaluator.env == {}
-    assert "unit-test-judge-key" not in output.read_text()
     assert task.metadata["skill2env_task"] == "task_example_abcd1234"
 
 
@@ -194,12 +195,20 @@ def test_launch_converts_rollout_counts_to_groups(tmp_path, monkeypatch, samples
     assert "--train.force_sync_mode" not in arguments
 
 
-def test_rubric_launch_requires_key_before_starting_services(tmp_path, monkeypatch):
-    dataset = tmp_path / "tasks.jsonl"
-    dataset.write_text(json.dumps({"task": {"evaluator": {"config": {"judge_api_key_env": "NVIDIA_API_KEY"}}}}))
-    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
-    monkeypatch.setenv("MODEL_PATH", str(tmp_path))
-    monkeypatch.setenv("PROMPT_DATASET", str(dataset))
-    result = subprocess.run(["bash", "examples/skill2env_rl_dppo/train_rl.sh"], capture_output=True, text=True)
-    assert result.returncode == 1
-    assert "NVIDIA_API_KEY is required" in result.stderr
+@pytest.mark.parametrize(
+    "judge_args", [[], ["--judge-base-url", "http://localhost:8001/v1"], ["--judge-model", "test-judge"]]
+)
+def test_rubric_prepare_requires_explicit_judge(tmp_path, judge_args):
+    output = tmp_path / "tasks.jsonl"
+    result = subprocess.run(
+        [
+            sys.executable, "examples/skill2env_rl_dppo/prepare.py",
+            "--dataset-dir", str(tmp_path), "--image-dir", str(tmp_path / "images"),
+            "--output", str(output), "--evaluator", "harbor_rubric", *judge_args,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "harbor_rubric requires --judge-base-url and --judge-model" in result.stderr
+    assert not output.exists()

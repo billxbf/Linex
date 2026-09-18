@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${MOLT_PATH:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
-MODEL_PATH="${MODEL_PATH:-/raid/binfeng/models/Qwen3.8-27B}"
+: "${MODEL_PATH:?Set MODEL_PATH to the local policy model directory}"
 SAVE_ROOT="${SAVE_ROOT:-$REPO_ROOT/outputs/skill2env_rl_dppo}"
 PROMPT_DATASET="${PROMPT_DATASET:-$SAVE_ROOT/train_tasks.jsonl}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-98304}"
@@ -22,10 +22,6 @@ fi
 
 test -d "$MODEL_PATH" || { echo "Policy model not found: $MODEL_PATH"; exit 1; }
 test -s "$PROMPT_DATASET" || { echo "Prepared task dataset not found: $PROMPT_DATASET (run prepare.py)"; exit 1; }
-if [ -z "${NVIDIA_API_KEY:-}" ] && grep -Eq '"judge_api_key_env"[[:space:]]*:[[:space:]]*"NVIDIA_API_KEY"' "$PROMPT_DATASET"; then
-  echo "NVIDIA_API_KEY is required by the prepared rubric tasks" >&2
-  exit 1
-fi
 command -v apptainer >/dev/null || { echo "Skill2Env RL requires Apptainer in PATH"; exit 1; }
 mkdir -p "$SAVE_ROOT"
 ulimit -n 65536 2>/dev/null || { echo "Skill2Env RL requires a nofile limit of at least 65536"; exit 1; }
@@ -65,8 +61,6 @@ PARTIAL_ROLLOUT_ARGS=()
 # beyond their summed-length budget. Dynamic batching remains opt-in.
 DYNAMIC_BATCH_ARGS=()
 [ "${DYNAMIC_BATCH:-0}" = "1" ] && DYNAMIC_BATCH_ARGS=(--train.dynamic_batch_enable --train.max_tokens_per_gpu "${MAX_TOKENS_PER_GPU:-16384}")
-WANDB_ARGS=()
-[ -n "${WANDB_KEY:-}" ] && WANDB_ARGS=(--logger.wandb.key "$WANDB_KEY")
 
 cd "$REPO_ROOT"
 python3 -u -m molt.cli.train_rl_ray \
@@ -126,5 +120,5 @@ python3 -u -m molt.cli.train_rl_ray \
   --logger.tensorboard_dir "$SAVE_ROOT/tensorboard" \
   --logger.wandb.project "${WANDB_PROJECT:-skill2env_rl_dppo}" \
   --logger.wandb.run_name "${WANDB_RUN_NAME:-dppo_g${SAMPLES_PER_PROMPT}_b${ROLLOUT_BATCH_SIZE}_$$}" \
-  "${RESUME_ARGS[@]}" "${EVAL_ARGS[@]}" "${PREFIX_CACHE_ARGS[@]}" "${PARTIAL_ROLLOUT_ARGS[@]}" "${DYNAMIC_BATCH_ARGS[@]}" "${WANDB_ARGS[@]}" \
+  "${RESUME_ARGS[@]}" "${EVAL_ARGS[@]}" "${PREFIX_CACHE_ARGS[@]}" "${PARTIAL_ROLLOUT_ARGS[@]}" "${DYNAMIC_BATCH_ARGS[@]}" \
   "$@"

@@ -4,7 +4,7 @@
 Every record pairs the task instruction with its complete Polar task specification: the
 Apptainer image, the pi harness against the Molt gateway, the ``prefix_merging`` trajectory
 builder, and a Harbor evaluator run in the same runtime. ``--evaluator harbor_rubric``
-adds behavior scoring with GPT-6 through NVIDIA inference.
+adds behavior scoring through a user-configured judge.
 """
 
 from __future__ import annotations
@@ -62,10 +62,12 @@ ENV PATH="/root/.local/bin:${PATH}"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-dir", type=Path, default=Path("/raid/binfeng/data/s2e/s2ev2_terminal_coding"))
-    parser.add_argument("--image-dir", type=Path, default=Path("/raid/binfeng/data/s2e/s2ev2_sif"))
+    parser.add_argument("--dataset-dir", type=Path, required=True)
+    parser.add_argument("--image-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--evaluator", choices=("harbor", "harbor_rubric"), default="harbor")
+    parser.add_argument("--judge-base-url", help="Judge endpoint root; required for harbor_rubric.")
+    parser.add_argument("--judge-model", help="Judge model name; required for harbor_rubric.")
     parser.add_argument("--rubric-coefficient", type=float, default=0.2, help="Additive judge reward weight.")
     parser.add_argument("--max-tasks", type=int, default=-1, help="Task cap in stable path order; -1 selects all.")
     parser.add_argument("--task", action="append", default=[], help="Select a task directory name; repeatable.")
@@ -95,6 +97,8 @@ def main() -> int:
     args = parser.parse_args()
     if not 0.0 <= args.rubric_coefficient <= 1.0:
         parser.error("--rubric-coefficient must be between 0 and 1")
+    if args.evaluator == "harbor_rubric" and not (args.judge_base_url and args.judge_model):
+        parser.error("harbor_rubric requires --judge-base-url and --judge-model")
 
     dataset_dir = args.dataset_dir.expanduser().resolve()
     image_dir = args.image_dir.expanduser().resolve()
@@ -184,9 +188,8 @@ def main() -> int:
         }
         if args.evaluator == "harbor_rubric":
             evaluator_config.update(
-                judge_base_url="https://inference-api.nvidia.com/v1",
-                judge_model="openai/openai/gpt-6-astra",
-                judge_api_key_env="NVIDIA_API_KEY",
+                judge_base_url=args.judge_base_url,
+                judge_model=args.judge_model,
                 rubric_coefficient=args.rubric_coefficient,
             )
         spec = TaskSpec.model_validate(
